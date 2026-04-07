@@ -51,8 +51,9 @@ class LocalWaypointsCalculator {
     static constexpr double overshoot_tolerance {1e-9};
     static constexpr double position_eps {1e-12};
     static constexpr int n_tracking_iterations {20};
-    static constexpr double sim_dt {0.0025};
     static constexpr double delta_u_ref_fraction {0.02};
+
+    double sim_dt {0.0025};
 
     struct DofLimits {
         double vmax, vmin, amax, amin, jmax;
@@ -99,7 +100,8 @@ class LocalWaypointsCalculator {
 
     bool solve_1dof(double p0, double v0, double a0,
                     double pf, double vf, double af,
-                    const DofLimits& lim) {
+                    const DofLimits& lim,
+                    std::optional<double> min_duration = std::nullopt) {
         bs_input.current_position[0] = p0;
         bs_input.current_velocity[0] = v0;
         bs_input.current_acceleration[0] = a0;
@@ -115,7 +117,7 @@ class LocalWaypointsCalculator {
         bs_input.control_interface = ControlInterface::Position;
         bs_input.synchronization = Synchronization::Time;
         bs_input.duration_discretization = DurationDiscretization::Continuous;
-        bs_input.minimum_duration = std::nullopt;
+        bs_input.minimum_duration = min_duration;
         bool interrupted = false;
         return bs_calc.template calculate<false>(bs_input, bs_traj, 0.0, interrupted)
                == Result::Working;
@@ -601,7 +603,7 @@ class LocalWaypointsCalculator {
                 double v1 = tracking.velocities[d][s+1];
                 double a1 = tracking.accelerations[d][s+1];
 
-                if (solve_1dof(p0, v0, a0, p1, v1, a1, dof_limits[d])) {
+                if (solve_1dof(p0, v0, a0, p1, v1, a1, dof_limits[d], sim_dt)) {
                     traj.profiles[s][d] = bs_traj.profiles[0][0];
                 } else {
                     // Fallback: constant-jerk approximation
@@ -672,6 +674,8 @@ public:
                      double delta_time, bool& was_interrupted) {
         was_interrupted = false;
         n_waypoints_ = input.intermediate_positions.size() + 2;
+
+        sim_dt = (delta_time > 0.0) ? std::min(0.0025, delta_time) : 0.0025;
 
         build_geometry(input);
         compute_accel_ranges(input);
