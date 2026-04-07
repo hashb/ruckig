@@ -81,11 +81,6 @@ def plot_compare(filename, inp_template, runs):
             ax.plot(t, v, color=color, linestyle=styles["velocity"], label=f"{label} vel", alpha=0.85)
             ax.plot(t, a, color=color, linestyle=styles["acceleration"], label=f"{label} acc", alpha=0.85)
 
-            # Section boundaries
-            traj = out_list[-1].trajectory
-            for tt in traj.intermediate_durations:
-                ax.axvline(x=tt, color=color, linestyle="--", linewidth=0.6, alpha=0.4)
-
         # Intermediate waypoint markers (target positions for this DoF)
         wp_y = [wp[dof] for wp in inp_template.intermediate_positions]
         ax.scatter([], [], color="black", marker="x", label="waypoint")
