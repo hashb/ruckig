@@ -57,7 +57,7 @@ public:
     {
     }
 
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
     template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
     explicit Ruckig(double delta_time, size_t max_number_of_waypoints):
         current_input(InputParameter<DOFs, CustomVector>(max_number_of_waypoints)),
@@ -89,7 +89,7 @@ public:
     {
     }
 
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
     template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
     explicit Ruckig(size_t dofs, double delta_time, size_t max_number_of_waypoints):
         current_input(InputParameter<DOFs, CustomVector>(dofs, max_number_of_waypoints)),
@@ -105,6 +105,22 @@ public:
     void reset() {
         current_input_initialized = false;
     }
+
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
+    //! Set the backend used for trajectories with intermediate waypoints.
+    //!
+    //! Only backends enabled at build time can be selected; selecting a
+    //! disabled backend will cause subsequent calculate() calls to fail.
+    void set_waypoints_backend(WaypointsBackend backend) {
+        calculator.waypoints_backend = backend;
+        current_input_initialized = false;
+    }
+
+    //! Get the active backend used for trajectories with intermediate waypoints.
+    WaypointsBackend get_waypoints_backend() const {
+        return calculator.waypoints_backend;
+    }
+#endif
 
     //! Filter intermediate positions based on a threshold distance for each DoF
     template<class T> using Vector = CustomVector<T, DOFs>;
