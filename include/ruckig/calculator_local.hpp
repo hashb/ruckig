@@ -21,17 +21,25 @@ namespace ruckig {
 
 //! @brief Offline calculation class for trajectories with intermediate waypoints.
 //!
-//! Implements the algorithm of:
+//! Implements the per-waypoint acceleration optimisation (Section III-B) of:
 //!     J. C. Kiemel and T. Kröger,
 //!     "Jerk-limited Traversal of One-dimensional Paths and its Application to
 //!      Multi-dimensional Path Tracking", arXiv:2407.13423, 2024.
 //!
-//! Each intermediate waypoint is treated as a path waypoint with zero velocity.
-//! For every waypoint a per-DoF binary search determines the largest feasible
-//! target acceleration that does not cause a position overshoot. Each section
+//! Each intermediate waypoint is treated as a path waypoint with zero velocity
+//! and zero boundary acceleration (as required by the paper). For every
+//! waypoint a per-DoF binary search determines the largest feasible target
+//! acceleration that does not cause a position overshoot (Eq. 4). Each section
 //! between two waypoints is then computed individually with the existing
 //! state-to-state TargetCalculator and the resulting profiles are concatenated
 //! into the output trajectory.
+//!
+//! @note This implementation covers only the 1-D waypoint acceleration
+//! optimisation from Section III-B of the paper. The multi-dimensional
+//! iterative tracking algorithm (Section IV — mapping factor m, slowest-
+//! dimension reference selection, and iterative u_ref updates) is NOT
+//! implemented; instead each segment uses Ruckig's built-in time
+//! synchronisation to align DoFs.
 //!
 //! Compared to the cloud-based Ruckig Pro implementation this calculator is
 //! offline (no network round trip) and self-contained, but it assumes the
@@ -109,52 +117,36 @@ class LocalWaypointsCalculator {
             && extrema.max <= p_high + overshoot_tolerance;
     }
 
-    //! Binary search for the maximum feasible target acceleration when leaving
-    //! a waypoint, i.e. find the largest a_out >= 0 such that the transition
-    //! (p_prev, 0, 0) -> (p_curr, 0, sign*a_out) is valid.
-    double find_max_a_out(double p_prev, double p_curr, double sign,
-                          double vmax, double vmin,
-                          double amax, double amin, double jmax) {
-        if (std::abs(p_curr - p_prev) < position_eps || amax <= 0.0) {
+    //! Binary search for the maximum feasible acceleration magnitude at a
+    //! waypoint transition. When \p is_target is true the acceleration is
+    //! placed at the target end: (p_from, 0, 0) -> (p_to, 0, sign*a).
+    //! When false it is placed at the start: (p_from, 0, sign*a) -> (p_to, 0, 0).
+    double find_max_a(double p_from, double p_to, double sign, bool is_target,
+                      double vmax, double vmin,
+                      double amax, double amin, double jmax) {
+        if (std::abs(p_to - p_from) < position_eps) {
             return 0.0;
         }
-        if (test_segment(p_prev, 0.0, 0.0, p_curr, 0.0, sign * amax,
-                         vmax, vmin, amax, amin, jmax)) {
-            return amax;
+        const double a_bound = (sign > 0.0) ? amax : std::abs(amin);
+        if (a_bound <= 0.0) {
+            return 0.0;
         }
-        double low = 0.0;
-        double high = amax;
-        for (int i = 0; i < binary_search_iterations; ++i) {
-            const double mid = 0.5 * (low + high);
-            if (test_segment(p_prev, 0.0, 0.0, p_curr, 0.0, sign * mid,
-                             vmax, vmin, amax, amin, jmax)) {
-                low = mid;
-            } else {
-                high = mid;
+        auto try_a = [&](double mag) -> bool {
+            if (is_target) {
+                return test_segment(p_from, 0.0, 0.0, p_to, 0.0, sign * mag,
+                                    vmax, vmin, amax, amin, jmax);
             }
-        }
-        return low;
-    }
-
-    //! Binary search for the maximum feasible input acceleration when entering
-    //! the next section: find the largest a_in >= 0 such that the transition
-    //! (p_curr, 0, sign*a_in) -> (p_next, 0, 0) is valid.
-    double find_max_a_in(double p_curr, double p_next, double sign,
-                         double vmax, double vmin,
-                         double amax, double amin, double jmax) {
-        if (std::abs(p_next - p_curr) < position_eps || amax <= 0.0) {
-            return 0.0;
-        }
-        if (test_segment(p_curr, 0.0, sign * amax, p_next, 0.0, 0.0,
-                         vmax, vmin, amax, amin, jmax)) {
-            return amax;
+            return test_segment(p_from, 0.0, sign * mag, p_to, 0.0, 0.0,
+                                vmax, vmin, amax, amin, jmax);
+        };
+        if (try_a(a_bound)) {
+            return a_bound;
         }
         double low = 0.0;
-        double high = amax;
+        double high = a_bound;
         for (int i = 0; i < binary_search_iterations; ++i) {
             const double mid = 0.5 * (low + high);
-            if (test_segment(p_curr, 0.0, sign * mid, p_next, 0.0, 0.0,
-                             vmax, vmin, amax, amin, jmax)) {
+            if (try_a(mid)) {
                 low = mid;
             } else {
                 high = mid;
@@ -229,15 +221,14 @@ public:
         traj.continue_calculation_counter = 0;
 
         // Allocate per-waypoint acceleration storage.
+        // The paper assumes a_0 = a_III = 0 at path endpoints, so boundary
+        // accelerations are always zero. The input's current/target
+        // accelerations are still forwarded to the segment solver below.
         if (waypoint_accelerations.size() < n_waypoints) {
             waypoint_accelerations.resize(n_waypoints);
         }
         for (size_t i = 0; i < n_waypoints; ++i) {
             waypoint_accelerations[i].assign(degrees_of_freedom, 0.0);
-        }
-        for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
-            waypoint_accelerations[0][dof] = input.current_acceleration[dof];
-            waypoint_accelerations[n_waypoints - 1][dof] = input.target_acceleration[dof];
         }
 
         // Find the largest feasible acceleration at every intermediate waypoint
@@ -278,10 +269,10 @@ public:
                 const double vmin = input.min_velocity ? (*input.min_velocity)[dof] : -vmax;
                 const double amin = input.min_acceleration ? (*input.min_acceleration)[dof] : -amax;
 
-                const double aout_max = find_max_a_out(p_prev[dof], p_curr[dof], sign,
-                                                        vmax, vmin, amax, amin, jmax);
-                const double ain_max = find_max_a_in(p_curr[dof], p_next[dof], sign,
-                                                      vmax, vmin, amax, amin, jmax);
+                const double aout_max = find_max_a(p_prev[dof], p_curr[dof], sign, true,
+                                                    vmax, vmin, amax, amin, jmax);
+                const double ain_max = find_max_a(p_curr[dof], p_next[dof], sign, false,
+                                                    vmax, vmin, amax, amin, jmax);
 
                 waypoint_accelerations[i][dof] = sign * std::min(aout_max, ain_max);
             }
@@ -303,8 +294,10 @@ public:
                 segment_input.target_velocity[dof] = (s == n_sections - 1)
                     ? input.target_velocity[dof] : 0.0;
 
-                segment_input.current_acceleration[dof] = waypoint_accelerations[s][dof];
-                segment_input.target_acceleration[dof] = waypoint_accelerations[s + 1][dof];
+                segment_input.current_acceleration[dof] = (s == 0)
+                    ? input.current_acceleration[dof] : waypoint_accelerations[s][dof];
+                segment_input.target_acceleration[dof] = (s == n_sections - 1)
+                    ? input.target_acceleration[dof] : waypoint_accelerations[s + 1][dof];
 
                 segment_input.max_velocity[dof] = input.max_velocity[dof];
                 segment_input.max_acceleration[dof] = input.max_acceleration[dof];
