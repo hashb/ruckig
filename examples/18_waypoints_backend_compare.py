@@ -15,23 +15,24 @@ from ruckig import InputParameter, OutputParameter, Result, Ruckig, WaypointsBac
 
 def make_input():
     inp = InputParameter(3)
-    inp.current_position = [0.0, 0.0, 0.0]
-    inp.current_velocity = [0.0, 0.0, 0.0]
-    inp.current_acceleration = [0.0, 0.0, 0.0]
+    inp.current_position = [0.2, 0, -0.3]
+    inp.current_velocity = [0, 0.2, 0]
+    inp.current_acceleration = [0, 0.6, 0]
 
     inp.intermediate_positions = [
-        [1.0, 0.5, -0.2],
-        [0.4, 1.5, 0.6],
-        [-0.3, 0.2, 1.0],
+        [1.4, -1.6, 1.0],
+        [-0.6, -0.5, 0.4],
+        [-0.4, -0.35, 0.0],
+        [0.8, 1.8, -0.1],
     ]
 
-    inp.target_position = [0.5, 1.0, 0.0]
-    inp.target_velocity = [0.0, 0.0, 0.0]
-    inp.target_acceleration = [0.0, 0.0, 0.0]
+    inp.target_position = [0.5, 1, 0]
+    inp.target_velocity = [0.2, 0, 0.3]
+    inp.target_acceleration = [0, 0.1, -0.1]
 
-    inp.max_velocity = [1.0, 1.0, 1.0]
-    inp.max_acceleration = [2.0, 2.0, 2.0]
-    inp.max_jerk = [6.0, 6.0, 6.0]
+    inp.max_velocity = [1, 2, 1]
+    inp.max_acceleration = [3, 2, 2]
+    inp.max_jerk = [6, 10, 20]
     return inp
 
 
@@ -122,4 +123,4 @@ if __name__ == "__main__":
     if len(runs) == 0:
         raise SystemExit("no backends produced a trajectory")
 
-    plot_compare("18_backend_compare.pdf", make_input(), runs)
+    plot_compare("18_backend_compare.png", make_input(), runs)
