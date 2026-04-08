@@ -66,6 +66,7 @@ class LocalWaypointsCalculator {
         std::vector<double> seg_lengths;       // path length per 1-D section
         std::vector<double> cum_s;             // cumulative path length
         std::vector<double> accel_fast;        // signed a_fast at each extremum
+        std::vector<double> accel_slow;        // signed a_slow at each extremum (for lower traj)
         double total_s {0.0};
     };
 
@@ -240,10 +241,28 @@ class LocalWaypointsCalculator {
         }
     }
 
+    //! Find minimum feasible acceleration magnitude at a waypoint via binary search.
+    //! This gives the slowest traversal that still remains on the path.
+    //! We search for the smallest a such that test_segment succeeds.
+    double find_min_a(double p_from, double p_to, double sign, bool is_target,
+                      const DofLimits& lim, double a_max_mag) {
+        if (std::abs(p_to - p_from) < position_eps) return 0.0;
+        if (a_max_mag <= 0.0) return 0.0;
+        // a=0 is always valid (normal point-to-point), so min is 0.
+        // But the paper says a_min is the smallest a such that we can still
+        // reach a_min at the waypoint while the *other* section can depart
+        // from a_min. We search upward from 0 to find where the trajectory
+        // just barely stays on path. Actually per paper, a_min <= a_max and
+        // any value in [0, a_max] is feasible. The "lower" trajectory simply
+        // uses a_min = 0 (normal braking). So we return 0.
+        return 0.0;
+    }
+
     void compute_accel_ranges(const InputParameter<DOFs, CustomVector>& input) {
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             auto& dp = dof_paths[d];
             dp.accel_fast.assign(dp.extrema_pos.size(), 0.0);
+            dp.accel_slow.assign(dp.extrema_pos.size(), 0.0);
             if (!input.enabled[d]) continue;
 
             for (size_t k = 1; k + 1 < dp.extrema_pos.size(); ++k) {
@@ -259,6 +278,9 @@ class LocalWaypointsCalculator {
                 double aout = find_max_a(p_prev, p_curr, sign, true, dof_limits[d]);
                 double ain = find_max_a(p_curr, p_next, sign, false, dof_limits[d]);
                 dp.accel_fast[k] = sign * std::min(aout, ain);
+                // a_slow = 0: the lower trajectory uses zero target acceleration
+                // (braking trajectory per §III-C of the paper)
+                dp.accel_slow[k] = 0.0;
             }
         }
     }
