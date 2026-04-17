@@ -29,7 +29,7 @@ namespace ruckig {
 //!
 //! Stages:
 //!   1. (III-B) Per-DoF binary search for max feasible acceleration at each
-//!      local extremum waypoint. Also computes a_min (slow progress).
+//!      local extremum waypoint.
 //!   2. (III-C) 1-D traversal: for each per-DoF section (between extrema),
 //!      compute upper (fast) and lower (slow) trajectories. Use mapping
 //!      factor m (Eq. 5) to interpolate progress.
@@ -53,13 +53,9 @@ class LocalWaypointsCalculator {
     static constexpr double overshoot_tolerance {1e-9};
     static constexpr double position_eps {1e-12};
     static constexpr int n_tracking_iterations {20};
-    static constexpr double delta_u_ref_fraction {0.02};
+    static constexpr double delta_u_ref_fraction {0.10};
 
     double sim_dt {0.0025};
-    // Trace-dump hooks (d=0 diagnostics).
-    double g_trc_last_T_u {0.0}, g_trc_last_T_l {0.0}, g_trc_last_T_i {0.0};
-    double g_trc_last_m {0.0}, g_trc_last_af_interp {0.0}, g_trc_last_af_upper {0.0};
-    double g_trc_last_sl {0.0}, g_trc_last_su {0.0};
 
     struct DofLimits {
         double vmax, vmin, amax, amin, jmax;
@@ -72,7 +68,6 @@ class LocalWaypointsCalculator {
         std::vector<double> seg_lengths;       // path length per 1-D section
         std::vector<double> cum_s;             // cumulative path length
         std::vector<double> accel_fast;        // signed a_fast at each extremum
-        std::vector<double> accel_slow;        // signed a_slow at each extremum (for lower traj)
         double total_s {0.0};
     };
 
@@ -247,28 +242,41 @@ class LocalWaypointsCalculator {
         }
     }
 
-    //! Find minimum feasible acceleration magnitude at a waypoint via binary search.
-    //! This gives the slowest traversal that still remains on the path.
-    //! We search for the smallest a such that test_segment succeeds.
-    double find_min_a(double p_from, double p_to, double sign, bool is_target,
-                      const DofLimits& lim, double a_max_mag) {
+    //! During online tracking (§III-C), a pure braking trajectory to target
+    //! acceleration 0 can become invalid as the current state approaches the
+    //! end of a section. In that case, the paper selects the smallest feasible
+    //! positive target acceleration a_min by binary search.
+    double find_min_online_target_a(double p_from, double v_from, double a_from,
+                                    double p_to, double sign,
+                                    const DofLimits& lim, double a_max_mag) {
         if (std::abs(p_to - p_from) < position_eps) return 0.0;
         if (a_max_mag <= 0.0) return 0.0;
-        // a=0 is always valid (normal point-to-point), so min is 0.
-        // But the paper says a_min is the smallest a such that we can still
-        // reach a_min at the waypoint while the *other* section can depart
-        // from a_min. We search upward from 0 to find where the trajectory
-        // just barely stays on path. Actually per paper, a_min <= a_max and
-        // any value in [0, a_max] is feasible. The "lower" trajectory simply
-        // uses a_min = 0 (normal braking). So we return 0.
-        return 0.0;
+
+        auto try_a = [&](double mag) -> bool {
+            return test_segment(p_from, v_from, a_from, p_to, 0.0, sign * mag, lim);
+        };
+
+        if (try_a(0.0)) return 0.0;
+        if (!try_a(a_max_mag)) return a_max_mag;
+
+        double lo = 0.0;
+        double hi = a_max_mag;
+        for (int i = 0; i < binary_search_iterations; ++i) {
+            const double mid = 0.5 * (lo + hi);
+            if (try_a(mid)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+
+        return hi;
     }
 
     void compute_accel_ranges(const InputParameter<DOFs, CustomVector>& input) {
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             auto& dp = dof_paths[d];
             dp.accel_fast.assign(dp.extrema_pos.size(), 0.0);
-            dp.accel_slow.assign(dp.extrema_pos.size(), 0.0);
             if (!input.enabled[d]) continue;
 
             for (size_t k = 1; k + 1 < dp.extrema_pos.size(); ++k) {
@@ -284,9 +292,6 @@ class LocalWaypointsCalculator {
                 double aout = find_max_a(p_prev, p_curr, sign, true, dof_limits[d]);
                 double ain = find_max_a(p_curr, p_next, sign, false, dof_limits[d]);
                 dp.accel_fast[k] = sign * std::min(aout, ain);
-                // a_slow = 0: the lower trajectory uses zero target acceleration
-                // (braking trajectory per §III-C of the paper)
-                dp.accel_slow[k] = 0.0;
             }
         }
     }
@@ -528,6 +533,30 @@ class LocalWaypointsCalculator {
         return dp.cum_s[sec] + s_within_section;
     }
 
+    double position_to_s(size_t d, double p) const {
+        const auto& dp = dof_paths[d];
+        if (dp.total_s < position_eps) return 0.0;
+
+        double best_s = 0.0;
+        double best_dist = std::numeric_limits<double>::infinity();
+        for (size_t sec = 0; sec + 1 < dp.extrema_pos.size(); ++sec) {
+            const double p_start = dp.extrema_pos[sec];
+            const double p_end = dp.extrema_pos[sec + 1];
+            const double lo = std::min(p_start, p_end);
+            const double hi = std::max(p_start, p_end);
+            const double p_clamped = std::min(std::max(p, lo), hi);
+            const double dist = std::abs(p - p_clamped);
+            const double s = dp.cum_s[sec] + std::abs(p_clamped - p_start);
+
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_s = s;
+            }
+        }
+
+        return std::min(std::max(best_s, 0.0), dp.total_s);
+    }
+
     struct TrackingResult {
         std::vector<std::vector<double>> positions;   // [dof][step]
         std::vector<std::vector<double>> velocities;
@@ -689,11 +718,7 @@ class LocalWaypointsCalculator {
         const double sign = (p_end >= p_start) ? 1.0 : -1.0;
 
         if (is_last) {
-            const double min_dur = std::max(time_remaining_in_sim, 0.0);
-            bool ok = solve_1dof(p, v, a, p_end, target_v, target_a, lim,
-                                  (min_dur > 1e-12) ? std::optional<double>(min_dur)
-                                                    : std::nullopt);
-            if (!ok) ok = solve_1dof(p, v, a, p_end, target_v, target_a, lim);
+            bool ok = solve_1dof(p, v, a, p_end, target_v, target_a, lim);
             if (!ok) ok = solve_1dof(p, v, a, p_end, 0.0, 0.0, lim);
             if (!ok) return;
 
@@ -725,14 +750,30 @@ class LocalWaypointsCalculator {
         const double step = std::min(dt_goal, T_u);
         double p_u, v_u, a_u;
         sample_traj(bs_traj, step, p_u, v_u, a_u);
+        double p_u_step, v_u_step, a_u_step;
+        sample_traj(bs_traj, dt_goal, p_u_step, v_u_step, a_u_step);
+        const Profile upper_profile = bs_traj.profiles[0][0];
         const double s_u = dp.cum_s[section] + sign * (p_u - p_start);
 
-        // Lower probe.
-        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+        // Lower probe: start with a braking trajectory. If it overshoots, find
+        // the smallest feasible target acceleration a_min as in §III-C.
+        double af_lower = 0.0;
+        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
+        if (!lower_ok) {
+            const double af_upper_mag = std::abs(af_upper);
+            const double amin_mag = find_min_online_target_a(
+                p_in, v_in, a_in, p_end, sign, lim, af_upper_mag
+            );
+            af_lower = sign * amin_mag;
+            lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
+        }
         if (!lower_ok) return;
         const double T_l = bs_traj.get_duration();
         double p_l, v_l, a_l;
         sample_traj(bs_traj, std::min(dt_goal, T_l), p_l, v_l, a_l);
+        double p_l_step, v_l_step, a_l_step;
+        sample_traj(bs_traj, dt_goal, p_l_step, v_l_step, a_l_step);
+        const Profile lower_profile = bs_traj.profiles[0][0];
         const double s_l = dp.cum_s[section] + sign * (p_l - p_start);
 
         // Mapping factor m from s_target.
@@ -747,14 +788,69 @@ class LocalWaypointsCalculator {
             m = std::min(std::max(m, 0.0), 1.0);
         }
 
-        // Intermediate trajectory: target accel = m · af_upper.
-        const double af_interp = m * af_upper;
-        bool ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_interp, lim);
-        if (!ok) ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+        // Intermediate trajectory: search for the target acceleration that
+        // yields a next-step progress closest to the desired s_target. Eq. 5
+        // interpolates desired progress between the lower and upper
+        // trajectories; it does not imply that progress varies linearly with
+        // the target acceleration.
+        Profile best_profile = lower_profile;
+        double best_p = p_l_step, best_v = v_l_step, best_a = a_l_step;
+        double best_T = T_l;
+        double best_err = std::abs(s_l - s_target);
+        {
+            const double err_u = std::abs(s_u - s_target);
+            if (err_u < best_err) {
+                best_profile = upper_profile;
+                best_p = p_u_step;
+                best_v = v_u_step;
+                best_a = a_u_step;
+                best_T = T_u;
+                best_err = err_u;
+            }
+        }
+
+        bool ok = false;
+        if (std::abs(af_upper - af_lower) < position_eps || ds < 1e-15) {
+            ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
+        } else {
+            double lo_mag = std::abs(af_lower);
+            double hi_mag = std::abs(af_upper);
+            for (int i = 0; i < binary_search_iterations; ++i) {
+                const double mid_mag = 0.5 * (lo_mag + hi_mag);
+                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, sign * mid_mag, lim)) {
+                    hi_mag = mid_mag;
+                    continue;
+                }
+
+                const double T_mid = bs_traj.get_duration();
+                double p_mid, v_mid, a_mid;
+                sample_traj(bs_traj, std::min(dt_goal, T_mid), p_mid, v_mid, a_mid);
+                double p_mid_step, v_mid_step, a_mid_step;
+                sample_traj(bs_traj, dt_goal, p_mid_step, v_mid_step, a_mid_step);
+                const double s_mid = dp.cum_s[section] + sign * (p_mid - p_start);
+                const double err_mid = std::abs(s_mid - s_target);
+                if (err_mid < best_err) {
+                    best_profile = bs_traj.profiles[0][0];
+                    best_p = p_mid_step;
+                    best_v = v_mid_step;
+                    best_a = a_mid_step;
+                    best_T = T_mid;
+                    best_err = err_mid;
+                }
+
+                if (s_mid < s_target) {
+                    lo_mag = mid_mag;
+                } else {
+                    hi_mag = mid_mag;
+                }
+            }
+
+            ok = true;
+        }
         if (!ok) return;
 
-        const double T_i = bs_traj.get_duration();
-        out_profile = bs_traj.profiles[0][0];
+        const double T_i = best_T;
+        out_profile = best_profile;
         out_profile_valid = true;
         // Always sample at dt_goal. If T_i < dt, Ruckig at_time(t > T) coasts
         // with j=0 past the profile end, which truncate_profile replicates
@@ -762,17 +858,9 @@ class LocalWaypointsCalculator {
         // exactly. Snapping to (p_end, 0, af_interp) here would desync
         // tracking-state from stored-profile end-state and manufacture
         // spurious position/velocity jumps at micro-segment boundaries.
-        double pp, vv, aa;
-        sample_traj(bs_traj, dt_goal, pp, vv, aa);
-        g_trc_last_T_u = T_u;
-        g_trc_last_T_l = T_l;
-        g_trc_last_T_i = T_i;
-        g_trc_last_m = m;
-        g_trc_last_af_interp = af_interp;
-        g_trc_last_af_upper = af_upper;
-        g_trc_last_sl = s_l;
-        g_trc_last_su = s_u;
-        p = pp; v = vv; a = aa;
+        p = best_p;
+        v = best_v;
+        a = best_a;
 
         // Section advance: the intermediate Ruckig profile either (a) physically
         // completed within this sim step (T_i ≤ dt, sampled state is coasted
@@ -794,9 +882,7 @@ class LocalWaypointsCalculator {
     //! upper/lower trajectory pair from the current state to the end of the
     //! current per-DoF section and mix their Δt-sampled states with the
     //! mapping factor m (Eq. 5) chosen so the per-DoF arc length matches
-    //! s_target := u_to_s_for_dof(d, u_ref[k]). Because both trajectories
-    //! start from the SAME state, the mixed state is kinematically feasible
-    //! (convex combination of jerk profiles remains within bounds).
+    //! s_target := u_to_s_for_dof(d, u_ref[k]).
     TrackingResult track(const InputParameter<DOFs, CustomVector>& input,
                          const std::vector<double>& u_ref,
                          const std::vector<std::vector<SectionTrajectory>>& /*fast_trajs*/) {
@@ -831,14 +917,13 @@ class LocalWaypointsCalculator {
         for (size_t k = 1; k < n_steps; ++k) {
             const double time_remaining = (n_steps - k) * sim_dt;
             for (size_t d = 0; d < degrees_of_freedom; ++d) {
-                size_t sec_prev = section_cur[d];
-                bool was_fin = finished[d] != 0;
                 if (finished[d]) {
                     res.positions[d][k]     = p_cur[d];
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
                 } else {
-                    const double s_target = u_to_s_for_dof(d, u_ref[k]);
+                    const double u_band_upper = std::min(total_u, u_ref[k] + delta_u_ref_fraction * total_u);
+                    const double s_target = u_to_s_for_dof(d, u_band_upper);
                     bool f = finished[d] != 0;
                     Profile step_prof;
                     bool prof_valid = false;
@@ -853,14 +938,6 @@ class LocalWaypointsCalculator {
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
                     if (prof_valid) res.profiles[d][k] = step_prof;
-                }
-                if (d == 0 && (k % 200 == 0 || section_cur[d] != sec_prev || finished[d] != was_fin
-                               || (k >= 1675 && k <= 1700))) {
-                    std::fprintf(stderr, "[dbg k=%zu d=%zu] p=%.6f v=%.6f a=%.5f sec=%zu T_u=%.5f T_l=%.5f T_i=%.5f m=%.3f af_interp=%.3f s_tgt=%.4f\n",
-                                 k, d, p_cur[d], v_cur[d], a_cur[d], section_cur[d],
-                                 g_trc_last_T_u, g_trc_last_T_l, g_trc_last_T_i,
-                                 g_trc_last_m, g_trc_last_af_interp,
-                                 u_to_s_for_dof(d, u_ref[k]));
                 }
             }
         }
@@ -884,69 +961,62 @@ class LocalWaypointsCalculator {
     void update_u_ref(std::vector<double>& u_ref, const TrackingResult& res) {
         if (res.n_steps < 2) return;
 
-        // Compute per-step deviation from the reference path position
-        std::vector<double> devs(res.n_steps, 0.0);
+        const double delta = delta_u_ref_fraction * total_u;
+
+        std::vector<std::vector<double>> u_actual(degrees_of_freedom, std::vector<double>(res.n_steps, 0.0));
+        std::vector<std::vector<double>> pos_dev(degrees_of_freedom, std::vector<double>(res.n_steps, 0.0));
         for (size_t k = 0; k < res.n_steps; ++k) {
-            double sq = 0.0;
             for (size_t d = 0; d < degrees_of_freedom; ++d) {
-                double diff = res.positions[d][k] - u_to_position(d, u_ref[k]);
-                sq += diff * diff;
+                const double s_d = position_to_s(d, res.positions[d][k]);
+                u_actual[d][k] = state_to_u(d, res.positions[d][k], s_d);
+                pos_dev[d][k] = std::abs(res.positions[d][k] - u_to_position(d, u_ref[k]));
             }
-            devs[k] = std::sqrt(sq);
         }
 
-        // Paper §III-D: find the contiguous deviation segment with the largest
-        // integrated area (not just the peak).
+        // Paper §III-D updates the single path dimension and contiguous time
+        // region whose undershoot of the desired u_ref band causes the largest
+        // integrated position deviation.
+        size_t best_d = 0;
         size_t best_lo = 0, best_hi = 0;
         double best_area = 0.0;
-        bool in_seg = false;
-        size_t seg_start = 0;
-        for (size_t k = 0; k <= res.n_steps; ++k) {
-            bool active = (k < res.n_steps && devs[k] > position_eps);
-            if (active && !in_seg) {
-                seg_start = k;
-                in_seg = true;
-            } else if (!active && in_seg) {
-                double area = 0.0;
-                for (size_t j = seg_start; j < k; ++j) area += devs[j];
-                if (area > best_area) {
-                    best_area = area;
-                    best_lo = seg_start;
-                    best_hi = k - 1;
+
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            bool in_seg = false;
+            size_t seg_start = 0;
+            for (size_t k = 0; k <= res.n_steps; ++k) {
+                const double lower_bound = (k < res.n_steps) ? std::max(0.0, u_ref[k] - delta) : 0.0;
+                const bool active = (k < res.n_steps && u_actual[d][k] < lower_bound - position_eps);
+                if (active && !in_seg) {
+                    seg_start = k;
+                    in_seg = true;
+                } else if (!active && in_seg) {
+                    double area = 0.0;
+                    for (size_t j = seg_start; j < k; ++j) {
+                        area += pos_dev[d][j];
+                    }
+                    if (area > best_area) {
+                        best_area = area;
+                        best_d = d;
+                        best_lo = seg_start;
+                        best_hi = k - 1;
+                    }
+                    in_seg = false;
                 }
-                in_seg = false;
             }
         }
         if (best_area <= 0.0) return;
 
-        const double delta = delta_u_ref_fraction * total_u;
-
-        // Lower u_ref in the worst region so the robot can track it next iteration.
+        // Lower u_ref in the selected region so that the offending dimension
+        // lies within the desired lower u_ref band in the next iteration.
         for (size_t k = best_lo; k <= best_hi; ++k) {
-            double min_u = total_u;
-            for (size_t d = 0; d < degrees_of_freedom; ++d) {
-                double p_d = res.positions[d][k];
-                double s_d = 0.0;
-                const auto& dp = dof_paths[d];
-                for (size_t s = 0; s + 1 < dp.extrema_pos.size(); ++s) {
-                    double p_start = dp.extrema_pos[s];
-                    double p_end   = dp.extrema_pos[s+1];
-                    if (p_d >= std::min(p_start, p_end) - overshoot_tolerance &&
-                        p_d <= std::max(p_start, p_end) + overshoot_tolerance) {
-                        s_d = dp.cum_s[s] + std::abs(p_d - p_start);
-                        break;
-                    }
-                }
-                min_u = std::min(min_u, state_to_u(d, p_d, s_d));
-            }
-            u_ref[k] = std::min(u_ref[k], min_u + delta);
+            u_ref[k] = std::min(u_ref[k], std::min(u_actual[best_d][k] + delta, total_u));
         }
 
-        // Enforce forward monotonicity starting from best_lo+1 so that the
-        // reduction at best_lo is NOT undone by a higher value at best_lo-1.
-        // The m-clamping in track() handles the case where u_ref < u_slow.
-        for (size_t k = best_lo + 1; k < res.n_steps; ++k)
-            u_ref[k] = std::max(u_ref[k], u_ref[k-1]);
+        // Keep u_ref monotonic after the local update.
+        for (size_t k = 1; k < res.n_steps; ++k) {
+            u_ref[k] = std::max(u_ref[k], u_ref[k - 1]);
+            u_ref[k] = std::min(u_ref[k], total_u);
+        }
         u_ref.back() = total_u;
     }
 
@@ -1018,114 +1088,136 @@ class LocalWaypointsCalculator {
         for (size_t d = 0; d < degrees_of_freedom; ++d)
             traj.independent_min_durations[d] = cumulative;
 
-        // Diagnostic: brake/accel usage in source profiles before truncate.
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            size_t n_brake = 0;
-            double max_brake_dur = 0.0;
-            size_t worst_s = 0;
-            for (size_t s = 0; s < n_micro; ++s) {
-                const Profile& src = tracking.profiles[d][s + 1];
-                if (src.brake.duration > 0.0) {
-                    n_brake++;
-                    if (src.brake.duration > max_brake_dur) {
-                        max_brake_dur = src.brake.duration;
-                        worst_s = s;
-                    }
-                }
-            }
-            if (n_brake > 0) {
-                const Profile& src = tracking.profiles[d][worst_s + 1];
-                std::fprintf(stderr, "[recon] dof=%zu: %zu profiles with brake (max=%.4f at s=%zu) brake_p0=%.5f v0=%.5f a0=%.5f main_p0=%.5f v0=%.5f a0=%.5f pf=%.5f\n",
-                             d, n_brake, max_brake_dur, worst_s,
-                             src.brake.p[0], src.brake.v[0], src.brake.a[0],
-                             src.p[0], src.v[0], src.a[0], src.pf);
-                // Show first 3 brakes for this DoF.
-                size_t shown = 0;
-                for (size_t s = 0; s < n_micro && shown < 3; ++s) {
-                    const Profile& p = tracking.profiles[d][s + 1];
-                    if (p.brake.duration > 0.0) {
-                        std::fprintf(stderr, "  brake[%zu] s=%zu dur=%.6f pf=%.5f vf=%.5f af=%.5f (tracking.pos[d][s]=%.5f, [d][s+1]=%.5f)\n",
-                                     shown, s, p.brake.duration, p.pf, p.vf, p.af,
-                                     tracking.positions[d][s], tracking.positions[d][s + 1]);
-                        shown++;
-                    }
-                }
-            }
-        }
-
-        // Diagnostic: check continuity across micro-segments.
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            double max_dp = 0.0, max_dv = 0.0, max_da = 0.0;
-            size_t worst_dp = 0, worst_dv = 0, worst_da = 0;
-            double max_jerk_any = 0.0;
-            size_t worst_jerk_s = 0, worst_jerk_phase = 0;
-            for (size_t s = 0; s + 1 < n_micro; ++s) {
-                double pf = traj.profiles[s][d].pf;
-                double p0 = traj.profiles[s+1][d].p[0];
-                double vf = traj.profiles[s][d].vf;
-                double v0 = traj.profiles[s+1][d].v[0];
-                double af = traj.profiles[s][d].af;
-                double a0 = traj.profiles[s+1][d].a[0];
-                double dp = std::abs(pf - p0);
-                double dv = std::abs(vf - v0);
-                double da = std::abs(af - a0);
-                if (dp > max_dp) { max_dp = dp; worst_dp = s; }
-                if (dv > max_dv) { max_dv = dv; worst_dv = s; }
-                if (da > max_da) { max_da = da; worst_da = s; }
-            }
-            for (size_t s = 0; s < n_micro; ++s) {
-                const Profile& pr = traj.profiles[s][d];
-                for (size_t ph = 0; ph < 7; ++ph) {
-                    if (std::abs(pr.j[ph]) > max_jerk_any) {
-                        max_jerk_any = std::abs(pr.j[ph]);
-                        worst_jerk_s = s;
-                        worst_jerk_phase = ph;
-                    }
-                }
-            }
-            std::fprintf(stderr, "[recon] dof=%zu: max_dp=%.3e (s=%zu) max_dv=%.3e (s=%zu) max_da=%.3e (s=%zu) max|j|=%.3f (s=%zu ph=%zu)\n",
-                         d, max_dp, worst_dp, max_dv, worst_dv, max_da, worst_da,
-                         max_jerk_any, worst_jerk_s, worst_jerk_phase);
-        }
         return Result::Working;
     }
 
-public:
-    size_t degrees_of_freedom;
+    bool needs_alignment_at_current(const InputParameter<DOFs, CustomVector>& input) const {
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            if (!input.enabled[d]) continue;
+            if (std::abs(input.current_velocity[d]) > position_eps
+                || std::abs(input.current_acceleration[d]) > position_eps) {
+                return true;
+            }
+        }
 
-    template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
-    explicit LocalWaypointsCalculator():
-        bs_calc(TargetCalculator<0, StandardVector>(1)),
-        bs_input(InputParameter<0, StandardVector>(1)),
-        bs_traj(Trajectory<0, StandardVector>(1)),
-        bs_traj_upper(Trajectory<0, StandardVector>(1)),
-        degrees_of_freedom(DOFs)
-    { initialize_binary_search_input(); }
+        return false;
+    }
 
-    template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
-    explicit LocalWaypointsCalculator(size_t):
-        LocalWaypointsCalculator() {}
+    bool needs_alignment_at_target(const InputParameter<DOFs, CustomVector>& input) const {
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            if (!input.enabled[d]) continue;
+            if (std::abs(input.target_velocity[d]) > position_eps
+                || std::abs(input.target_acceleration[d]) > position_eps) {
+                return true;
+            }
+        }
 
-    template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
-    explicit LocalWaypointsCalculator(size_t dofs):
-        segment_calc(TargetCalculator<DOFs, CustomVector>(dofs)),
-        segment_input(InputParameter<DOFs, CustomVector>(dofs)),
-        segment_traj(Trajectory<DOFs, CustomVector>(dofs)),
-        bs_calc(TargetCalculator<0, StandardVector>(1)),
-        bs_input(InputParameter<0, StandardVector>(1)),
-        bs_traj(Trajectory<0, StandardVector>(1)),
-        bs_traj_upper(Trajectory<0, StandardVector>(1)),
-        degrees_of_freedom(dofs)
-    { initialize_binary_search_input(); }
+        return false;
+    }
 
-    template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
-    explicit LocalWaypointsCalculator(size_t dofs, size_t):
-        LocalWaypointsCalculator(dofs) {}
+    InputParameter<DOFs, CustomVector> make_alignment_input(
+            const InputParameter<DOFs, CustomVector>& input,
+            const Vector<double>& current_position,
+            const Vector<double>& current_velocity,
+            const Vector<double>& current_acceleration,
+            const Vector<double>& target_position,
+            const Vector<double>& target_velocity,
+            const Vector<double>& target_acceleration) const {
+        InputParameter<DOFs, CustomVector> align_input = input;
+        align_input.intermediate_positions.clear();
+        align_input.per_section_max_velocity = std::nullopt;
+        align_input.per_section_max_acceleration = std::nullopt;
+        align_input.per_section_max_jerk = std::nullopt;
+        align_input.per_section_min_velocity = std::nullopt;
+        align_input.per_section_min_acceleration = std::nullopt;
+        align_input.per_section_max_position = std::nullopt;
+        align_input.per_section_min_position = std::nullopt;
+        align_input.per_section_minimum_duration = std::nullopt;
+        align_input.current_position = current_position;
+        align_input.current_velocity = current_velocity;
+        align_input.current_acceleration = current_acceleration;
+        align_input.target_position = target_position;
+        align_input.target_velocity = target_velocity;
+        align_input.target_acceleration = target_acceleration;
+        align_input.control_interface = ControlInterface::Position;
+        align_input.synchronization = Synchronization::Time;
+        align_input.duration_discretization = DurationDiscretization::Continuous;
+        align_input.per_dof_control_interface = std::nullopt;
+        align_input.per_dof_synchronization = std::nullopt;
+        align_input.minimum_duration = std::nullopt;
+        return align_input;
+    }
+
+    Vector<double> make_zero_vector() const {
+        if constexpr (DOFs == 0) {
+            Vector<double> v;
+            v.resize(degrees_of_freedom);
+            for (size_t d = 0; d < degrees_of_freedom; ++d) v[d] = 0.0;
+            return v;
+        } else {
+            Vector<double> v {};
+            for (size_t d = 0; d < degrees_of_freedom; ++d) v[d] = 0.0;
+            return v;
+        }
+    }
+
+    Trajectory<DOFs, CustomVector> make_temp_trajectory() const {
+        if constexpr (DOFs == 0) {
+            return Trajectory<DOFs, CustomVector>(degrees_of_freedom);
+        } else {
+            return Trajectory<DOFs, CustomVector>();
+        }
+    }
+
+    size_t count_sections(const Trajectory<DOFs, CustomVector>& traj) const {
+        return (traj.get_duration() > position_eps) ? traj.profiles.size() : 0;
+    }
+
+    size_t append_trajectory_sections(const Trajectory<DOFs, CustomVector>& src,
+                                      Trajectory<DOFs, CustomVector>& dst,
+                                      size_t dst_offset,
+                                      double& time_offset) const {
+        if (src.get_duration() <= position_eps) return dst_offset;
+
+        for (size_t s = 0; s < src.profiles.size(); ++s) {
+            dst.profiles[dst_offset] = src.profiles[s];
+            dst.cumulative_times[dst_offset] = time_offset + src.cumulative_times[s];
+            ++dst_offset;
+        }
+
+        time_offset += src.get_duration();
+        return dst_offset;
+    }
+
+    void concatenate_trajectories(const Trajectory<DOFs, CustomVector>& pre_traj,
+                                  const Trajectory<DOFs, CustomVector>& main_traj,
+                                  const Trajectory<DOFs, CustomVector>& post_traj,
+                                  Trajectory<DOFs, CustomVector>& traj) {
+        const size_t n_pre = count_sections(pre_traj);
+        const size_t n_main = count_sections(main_traj);
+        const size_t n_post = count_sections(post_traj);
+        const size_t total_sections = n_pre + n_main + n_post;
+
+        traj.degrees_of_freedom = degrees_of_freedom;
+        traj.resize((total_sections > 0) ? total_sections - 1 : 0);
+        traj.continue_calculation_counter = 0;
+
+        size_t dst_offset = 0;
+        double time_offset = 0.0;
+        dst_offset = append_trajectory_sections(pre_traj, traj, dst_offset, time_offset);
+        dst_offset = append_trajectory_sections(main_traj, traj, dst_offset, time_offset);
+        dst_offset = append_trajectory_sections(post_traj, traj, dst_offset, time_offset);
+
+        traj.duration = time_offset;
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            traj.independent_min_durations[d] = time_offset;
+        }
+    }
 
     template<bool throw_error>
-    Result calculate(const InputParameter<DOFs, CustomVector>& input,
-                     Trajectory<DOFs, CustomVector>& traj,
-                     double delta_time, bool& was_interrupted) {
+    Result calculate_core(const InputParameter<DOFs, CustomVector>& input,
+                          Trajectory<DOFs, CustomVector>& traj,
+                          double delta_time, bool& was_interrupted) {
         was_interrupted = false;
         n_waypoints_ = input.intermediate_positions.size() + 2;
 
@@ -1205,15 +1297,17 @@ public:
         // result has zero deviation (u_ref == s), so no iteration is needed;
         // for multi-DoF we iterate and keep the iteration with the lowest
         // average deviation.
-        std::fprintf(stderr, "[calc] tracking start n_steps=%zu\n", n_steps);
         TrackingResult latest = track(input, u_ref, fast_trajs);
-        std::fprintf(stderr, "[calc] tracking done\n");
+        std::fprintf(stderr, "[local dbg] iter=0 avg_dev=%.6f max_dev=%.6f\n",
+                     latest.avg_deviation, latest.max_deviation);
         TrackingResult best = latest;
         std::vector<double> best_u_ref = u_ref;
         if (degrees_of_freedom > 1) {
-            for (int iter = 1; iter < 1 /* n_tracking_iterations */; ++iter) {
+            for (int iter = 1; iter < n_tracking_iterations; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
+                std::fprintf(stderr, "[local dbg] iter=%d avg_dev=%.6f max_dev=%.6f\n",
+                             iter, latest.avg_deviation, latest.max_deviation);
                 if (latest.avg_deviation < best.avg_deviation) {
                     best = latest;
                     best_u_ref = u_ref;
@@ -1222,7 +1316,134 @@ public:
             u_ref = best_u_ref;
         }
 
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            size_t n_valid_profiles = 0;
+            for (size_t k = 1; k < best.n_steps; ++k) {
+                const Profile& src = best.profiles[d][k];
+                const bool has_profile =
+                    src.t[0] > 0.0 || src.t[1] > 0.0 || src.t[2] > 0.0 ||
+                    src.t[3] > 0.0 || src.t[4] > 0.0 || src.t[5] > 0.0 ||
+                    src.t[6] > 0.0 || src.brake.duration > 0.0;
+                n_valid_profiles += has_profile ? 1 : 0;
+            }
+            std::fprintf(stderr,
+                         "[local dbg] dof=%zu final_tracking p=%.6f v=%.6f a=%.6f valid_profiles=%zu/%zu\n",
+                         d,
+                         best.positions[d].back(),
+                         best.velocities[d].back(),
+                         best.accelerations[d].back(),
+                         n_valid_profiles,
+                         best.n_steps > 0 ? best.n_steps - 1 : 0);
+        }
+
         return reconstruct<throw_error>(best, input, traj);
+    }
+
+public:
+    size_t degrees_of_freedom;
+
+    template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
+    explicit LocalWaypointsCalculator():
+        bs_calc(TargetCalculator<0, StandardVector>(1)),
+        bs_input(InputParameter<0, StandardVector>(1)),
+        bs_traj(Trajectory<0, StandardVector>(1)),
+        bs_traj_upper(Trajectory<0, StandardVector>(1)),
+        degrees_of_freedom(DOFs)
+    { initialize_binary_search_input(); }
+
+    template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
+    explicit LocalWaypointsCalculator(size_t):
+        LocalWaypointsCalculator() {}
+
+    template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
+    explicit LocalWaypointsCalculator(size_t dofs):
+        segment_calc(TargetCalculator<DOFs, CustomVector>(dofs)),
+        segment_input(InputParameter<DOFs, CustomVector>(dofs)),
+        segment_traj(Trajectory<DOFs, CustomVector>(dofs)),
+        bs_calc(TargetCalculator<0, StandardVector>(1)),
+        bs_input(InputParameter<0, StandardVector>(1)),
+        bs_traj(Trajectory<0, StandardVector>(1)),
+        bs_traj_upper(Trajectory<0, StandardVector>(1)),
+        degrees_of_freedom(dofs)
+    { initialize_binary_search_input(); }
+
+    template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
+    explicit LocalWaypointsCalculator(size_t dofs, size_t):
+        LocalWaypointsCalculator(dofs) {}
+
+    template<bool throw_error>
+    Result calculate(const InputParameter<DOFs, CustomVector>& input,
+                     Trajectory<DOFs, CustomVector>& traj,
+                     double delta_time, bool& was_interrupted) {
+        const bool align_current = needs_alignment_at_current(input);
+        const bool align_target = needs_alignment_at_target(input);
+
+        if (!align_current && !align_target) {
+            return calculate_core<throw_error>(input, traj, delta_time, was_interrupted);
+        }
+
+        InputParameter<DOFs, CustomVector> core_input = input;
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            if (!input.enabled[d]) continue;
+            core_input.current_velocity[d] = 0.0;
+            core_input.current_acceleration[d] = 0.0;
+            core_input.target_velocity[d] = 0.0;
+            core_input.target_acceleration[d] = 0.0;
+        }
+
+        const Vector<double> zero_velocity = make_zero_vector();
+        const Vector<double> zero_acceleration = make_zero_vector();
+
+        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
+        Trajectory<DOFs, CustomVector> main_traj = make_temp_trajectory();
+        Trajectory<DOFs, CustomVector> post_traj = make_temp_trajectory();
+
+        bool pre_interrupted = false;
+        bool main_interrupted = false;
+        bool post_interrupted = false;
+
+        if (align_current) {
+            const auto pre_input = make_alignment_input(
+                input,
+                input.current_position,
+                input.current_velocity,
+                input.current_acceleration,
+                input.current_position,
+                zero_velocity,
+                zero_acceleration
+            );
+
+            const Result pre_res = segment_calc.template calculate<throw_error>(
+                pre_input, pre_traj, delta_time, pre_interrupted
+            );
+            if (pre_res < 0) return pre_res;
+        }
+
+        const Result main_res = calculate_core<throw_error>(
+            core_input, main_traj, delta_time, main_interrupted
+        );
+        if (main_res < 0) return main_res;
+
+        if (align_target) {
+            const auto post_input = make_alignment_input(
+                input,
+                input.target_position,
+                zero_velocity,
+                zero_acceleration,
+                input.target_position,
+                input.target_velocity,
+                input.target_acceleration
+            );
+
+            const Result post_res = segment_calc.template calculate<throw_error>(
+                post_input, post_traj, delta_time, post_interrupted
+            );
+            if (post_res < 0) return post_res;
+        }
+
+        concatenate_trajectories(pre_traj, main_traj, post_traj, traj);
+        was_interrupted = pre_interrupted || main_interrupted || post_interrupted;
+        return Result::Working;
     }
 
     template<bool throw_error>
