@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdio>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -1506,7 +1505,6 @@ class LocalWaypointsCalculator {
                 compute_fast_trajectories(slowest_t, slowest, min_fast_section_duration);
             }
         }
-        std::fprintf(stderr, "[local] sim_dt=%.6f min_fast_sec_dur=%.6f slowest=%zu\n", sim_dt, min_fast_section_duration, slowest);
 
         if (slowest_t < sim_dt) {
             // Trivial: direct solve
@@ -1558,26 +1556,10 @@ class LocalWaypointsCalculator {
         TrackingResult latest = track(input, u_ref, fast_trajs);
         TrackingResult best = latest;
         std::vector<double> best_u_ref = u_ref;
-        std::fprintf(stderr, "[local] sim_dt=%.6f n_steps=%zu total_u=%.4f\n", sim_dt, latest.n_steps, total_u);
-        // Print d=0 at a few key indices
-        auto dump = [&](const TrackingResult& r, const std::vector<double>& ur, int iter){
-            size_t N = r.n_steps;
-            size_t idx[6] = {0, N/5, 2*N/5, 3*N/5, 4*N/5, N-1};
-            std::fprintf(stderr, "[local] iter=%d:\n", iter);
-            for (size_t i : idx) {
-                std::fprintf(stderr, "  k=%zu u_ref=%.4f | d0 p=%.4f u=%.4f | d1 p=%.4f u=%.4f | d2 p=%.4f u=%.4f\n",
-                    i, ur[i],
-                    r.positions[0][i], r.u_values[0][i],
-                    r.positions[1][i], r.u_values[1][i],
-                    r.positions[2][i], r.u_values[2][i]);
-            }
-        };
-        dump(latest, u_ref, 0);
         if (degrees_of_freedom > 1) {
             for (int iter = 1; iter < n_tracking_iterations; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
-                if (iter <= 2 || iter == n_tracking_iterations - 1) dump(latest, u_ref, iter);
                 if (latest.avg_path_deviation < best.avg_path_deviation) {
                     best = latest;
                     best_u_ref = u_ref;
