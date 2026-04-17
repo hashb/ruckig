@@ -115,6 +115,38 @@ def path_deviations(positions, ref_poly):
     return dists
 
 
+def path_deviations_per_axis(positions, ref_poly):
+    """For each row in *positions* compute the per-axis absolute distance to
+    the nearest point on *ref_poly*.
+
+    Parameters
+    ----------
+    positions : (T, D) array  – sampled trajectory positions
+    ref_poly  : (N, D) array  – reference piecewise-linear waypoints
+
+    Returns
+    -------
+    axis_devs : (T, D) array of absolute per-axis deviations
+    """
+    n_segs = len(ref_poly) - 1
+    best_dist_sq = np.full(len(positions), np.inf)
+    closest = np.empty_like(positions)
+    for seg in range(n_segs):
+        a, b = ref_poly[seg], ref_poly[seg + 1]
+        ab = b - a
+        len_sq = float(np.dot(ab, ab))
+        if len_sq < 1e-18:
+            cand = np.tile(a, (len(positions), 1))
+        else:
+            t = np.clip(np.dot(positions - a, ab) / len_sq, 0.0, 1.0)
+            cand = a + t[:, None] * ab
+        dist_sq = np.sum((positions - cand) ** 2, axis=1)
+        mask = dist_sq < best_dist_sq
+        best_dist_sq[mask] = dist_sq[mask]
+        closest[mask] = cand[mask]
+    return np.abs(positions - closest)
+
+
 def resample_positions_uniform(out_list, n_samples=1000):
     """Return positions resampled at *n_samples* evenly-spaced arc-length
     fractions so that comparison is time-independent.
@@ -163,6 +195,8 @@ def compare_paths(runs, ref_poly, n_samples=2000):
     print(header)
     print("-" * len(header))
 
+    axis_labels = [f"ax{d+1}" for d in range(ref_poly.shape[1])]
+
     resampled = {}
     dev_from_ref = {}
     for run_key, (label, out_list) in runs.items():
@@ -171,6 +205,9 @@ def compare_paths(runs, ref_poly, n_samples=2000):
         dev = path_deviations(pos, ref_poly)
         dev_from_ref[run_key] = dev
         report_deviation(label, dev)
+        axis_devs = path_deviations_per_axis(pos, ref_poly)
+        for d, ax_label in enumerate(axis_labels):
+            report_deviation(f"  {label}/{ax_label}", axis_devs[:, d])
 
     # Cross-backend comparison (if both present, use the shorter resampled path)
     keys = list(runs.keys())

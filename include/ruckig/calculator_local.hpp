@@ -764,14 +764,10 @@ class LocalWaypointsCalculator {
                          size_t& section,
                          bool& finished,
                          double dt_goal,
-                         double s_lower_bound,
-                         double s_upper_bound,
-                         bool prefer_upper,
-                         bool& flip_preference,
+                         double s_target,
                          double target_v, double target_a,
                          double time_remaining_in_sim) {
         out_profile_valid = false;
-        flip_preference = false;
         if (finished) return;
 
         const auto& dp = dof_paths[d];
@@ -822,11 +818,12 @@ class LocalWaypointsCalculator {
             if (upper_ok) af_upper = 0.0;
         }
         if (!upper_ok) return;
-        const double T_u = bs_traj.get_duration();
-        double p_u_step, v_u_step, a_u_step;
-        sample_traj(bs_traj, dt_goal, p_u_step, v_u_step, a_u_step);
-        const Profile upper_profile = bs_traj.profiles[0][0];
-        const double s_u = forward_position_to_s(d, section, p_u_step);
+        double s_u;
+        {
+            double p_u_step, v_u_step, a_u_step;
+            sample_traj(bs_traj, dt_goal, p_u_step, v_u_step, a_u_step);
+            s_u = forward_position_to_s(d, section, p_u_step);
+        }
 
         // Lower probe: start with a braking trajectory. If it overshoots, find
         // the smallest feasible target acceleration a_min as in §III-C.
@@ -841,66 +838,49 @@ class LocalWaypointsCalculator {
             lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
         }
         if (!lower_ok) return;
-        const double T_l = bs_traj.get_duration();
-        double p_l_step, v_l_step, a_l_step;
-        sample_traj(bs_traj, dt_goal, p_l_step, v_l_step, a_l_step);
-        const Profile lower_profile = bs_traj.profiles[0][0];
-        const double s_l = forward_position_to_s(d, section, p_l_step);
+        double s_l;
+        {
+            double p_l_step, v_l_step, a_l_step;
+            sample_traj(bs_traj, dt_goal, p_l_step, v_l_step, a_l_step);
+            s_l = forward_position_to_s(d, section, p_l_step);
+        }
 
-        const bool lower_in_band = s_l >= s_lower_bound - position_eps && s_l <= s_upper_bound + position_eps;
-        const bool upper_in_band = s_u >= s_lower_bound - position_eps && s_u <= s_upper_bound + position_eps;
-
-        Profile best_profile = lower_profile;
-        double best_p = p_l_step, best_v = v_l_step, best_a = a_l_step;
-        double best_T = T_l;
-        bool choose_upper = false;
-
-        if (s_u < s_lower_bound - position_eps) {
-            choose_upper = true;
-        } else if (s_l > s_upper_bound + position_eps) {
-            choose_upper = false;
-        } else if (lower_in_band && upper_in_band) {
-            choose_upper = prefer_upper;
-            flip_preference = true;
-        } else if (!lower_in_band && upper_in_band) {
-            choose_upper = true;
-        } else if (lower_in_band && !upper_in_band) {
-            choose_upper = false;
+        // Compute mapping factor m ∈ [0, 1] so that the sampled arc-length
+        // at Δt interpolates between lower (m=0) and upper (m=1) trajectories
+        // to match s_target as closely as possible (paper §III-C Eq. 5).
+        const double s_range = s_u - s_l;
+        double m;
+        if (s_range > position_eps) {
+            m = (s_target - s_l) / s_range;
+            m = std::max(0.0, std::min(1.0, m));
         } else {
-            const double s_mid = 0.5 * (s_lower_bound + s_upper_bound);
-            choose_upper = std::abs(s_u - s_mid) <= std::abs(s_l - s_mid);
+            m = (s_target >= 0.5 * (s_u + s_l) - position_eps) ? 1.0 : 0.0;
         }
 
-        if (choose_upper) {
-            best_profile = upper_profile;
-            best_p = p_u_step;
-            best_v = v_u_step;
-            best_a = a_u_step;
-            best_T = T_u;
+        // Interpolated target acceleration: af_lower at m=0, af_upper at m=1.
+        const double af_interp = af_lower + m * (af_upper - af_lower);
+
+        // Solve the intermediate trajectory with the interpolated target accel.
+        if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_interp, lim)) {
+            // Fallback: try the nearer valid endpoint.
+            if (m >= 0.5) {
+                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim) &&
+                    !solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim)) {
+                    return;
+                }
+            } else {
+                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim) &&
+                    !solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)) {
+                    return;
+                }
+            }
         }
 
-        bool ok = true;
-        if (!ok) return;
-
-        const double T_i = best_T;
-        out_profile = best_profile;
+        const double T_i = bs_traj.get_duration();
+        out_profile = bs_traj.profiles[0][0];
         out_profile_valid = true;
-        // Always sample at dt_goal. If T_i < dt, Ruckig at_time(t > T) coasts
-        // with j=0 past the profile end, which truncate_profile replicates
-        // with a zero-jerk extension slot — the two representations match
-        // exactly. Snapping to (p_end, 0, af_interp) here would desync
-        // tracking-state from stored-profile end-state and manufacture
-        // spurious position/velocity jumps at micro-segment boundaries.
-        p = best_p;
-        v = best_v;
-        a = best_a;
+        sample_traj(bs_traj, dt_goal, p, v, a);
 
-        // Section advance: the intermediate Ruckig profile either (a) physically
-        // completed within this sim step (T_i ≤ dt, sampled state is coasted
-        // past target in next-section direction), or (b) the sampled position
-        // has already crossed p_end in the travel direction (reached_pend).
-        // Both imply we have left the current section — no state snapping here,
-        // the Ruckig sample is authoritative.
         const bool completed = T_i <= dt_goal + 1e-12;
         const bool reached_pend = sign * (p - p_end) >= -1e-12;
         if (completed || reached_pend) {
@@ -933,7 +913,6 @@ class LocalWaypointsCalculator {
         std::vector<double> p_cur(degrees_of_freedom), v_cur(degrees_of_freedom), a_cur(degrees_of_freedom);
         std::vector<size_t> section_cur(degrees_of_freedom, 0);
         std::vector<char> finished(degrees_of_freedom, 0);
-        std::vector<bool> prefer_upper(degrees_of_freedom, true);
 
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             res.positions[d].resize(n_steps);
@@ -962,23 +941,17 @@ class LocalWaypointsCalculator {
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
                 } else {
-                    const double u_band_lower = std::max(0.0, u_ref[k] - delta_u_ref);
-                    const double u_band_upper = std::min(total_u, u_ref[k] + delta_u_ref);
-                    const double s_lower_bound = u_to_s_for_dof(d, u_band_lower);
-                    const double s_upper_bound = u_to_s_for_dof(d, u_band_upper);
+                    const double s_target = u_to_s_for_dof(d, u_ref[k]);
                     bool f = finished[d] != 0;
                     Profile step_prof;
                     bool prof_valid = false;
-                    bool flip_preference = false;
                     advance_one_dof(d, p_cur[d], v_cur[d], a_cur[d], step_prof, prof_valid,
                                     section_cur[d], f,
-                                    sim_dt, s_lower_bound, s_upper_bound,
-                                    prefer_upper[d], flip_preference,
+                                    sim_dt, s_target,
                                     input.target_velocity[d],
                                     input.target_acceleration[d],
                                     time_remaining);
                     finished[d] = f ? 1 : 0;
-                    if (flip_preference) prefer_upper[d] = !prefer_upper[d];
                     res.positions[d][k]     = p_cur[d];
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
