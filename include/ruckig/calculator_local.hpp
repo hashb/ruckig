@@ -891,14 +891,19 @@ class LocalWaypointsCalculator {
             c.s_dt = forward_position_to_s(d, section, c.p_dt);
         };
 
+        // Extend position bounds to include p_in so that a slight overshoot
+        // from the previous section does not cause every trajectory to fail.
+        const double bound_lo = std::min({p_in, p_start, p_end});
+        const double bound_hi = std::max({p_in, p_start, p_end});
+
         // --- Upper (fast) trajectory: position control to (p_end, 0, af_fast).
         double af_upper = af_upper_nominal;
         Candidate upper{};
         if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)
-            && trajectory_stays_on_section(bs_traj, p_start, p_end, false)) {
+            && trajectory_stays_on_section(bs_traj, bound_lo, bound_hi, false)) {
             sample_into(upper);
         } else if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim)
-                   && trajectory_stays_on_section(bs_traj, p_start, p_end, false)) {
+                   && trajectory_stays_on_section(bs_traj, bound_lo, bound_hi, false)) {
             af_upper = 0.0;
             sample_into(upper);
         }
@@ -908,8 +913,9 @@ class LocalWaypointsCalculator {
         // overshoots the section end, fall back to a position-control solve
         // with the smallest feasible positive target acceleration.
         Candidate lower{};
-        const double brake_bound_lo = std::min(p_start, p_end) - overshoot_tolerance;
-        const double brake_bound_hi = std::max(p_start, p_end) + overshoot_tolerance;
+        double af_lower_used = 0.0;  // Track lower target acceleration for intermediate interpolation
+        const double brake_bound_lo = bound_lo - overshoot_tolerance;
+        const double brake_bound_hi = bound_hi + overshoot_tolerance;
 
         bool brake_valid = false;
         if (solve_brake(p_in, v_in, a_in, lim)) {
@@ -918,6 +924,7 @@ class LocalWaypointsCalculator {
             if (ext.min >= brake_bound_lo && ext.max <= brake_bound_hi) {
                 brake_valid = true;
                 sample_into(lower);
+                af_lower_used = 0.0;
             }
         }
         if (!brake_valid) {
@@ -927,12 +934,13 @@ class LocalWaypointsCalculator {
             );
             if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, sign * amin_mag, lim)) {
                 sample_into(lower);
+                af_lower_used = sign * amin_mag;
             }
         }
 
         if (!upper.ok && !lower.ok) return;
-        if (!upper.ok) upper = lower;
-        if (!lower.ok) lower = upper;
+        if (!upper.ok) { upper = lower; af_upper = af_lower_used; }
+        if (!lower.ok) { lower = upper; af_lower_used = af_upper; }
 
         // --- Mapping factor m ∈ [0, 1] (paper Eq. 5).
         const double s_u = upper.s_dt;
@@ -946,20 +954,11 @@ class LocalWaypointsCalculator {
             m = (s_target >= 0.5 * (s_u + s_l) - position_eps) ? 1.0 : 0.0;
         }
 
-        // --- Intermediate trajectory (paper §III-C). Using a continuous
-        // mapping factor m requires an actual intermediate trajectory whose
-        // first-dt progress matches s_desired = s_l + m·(s_u − s_l).
-        //
-        // Exploit the fact that for small dt, both upper and lower are in
-        // their first jerk phase, and the resulting kinematic state is a
-        // polynomial in the applied jerk. A convex combination of upper's
-        // and lower's first-phase jerks, applied for one dt from the current
-        // state, produces the convex combination of their Δt-sampled
-        // kinematic states — precisely s_desired.
-        //
-        // The single mixed jerk stays inside [min(j_l,j_u), max(j_l,j_u)]
-        // ⊂ [-j_max, j_max], and the resulting v and a are convex
-        // combinations of feasible states, so all limits remain satisfied.
+        // --- Intermediate trajectory (paper §III-C). For small dt, both
+        // upper and lower are in their first jerk phase, and the kinematic
+        // state is polynomial in the applied jerk. A convex combination of
+        // upper's and lower's first-phase jerks produces the convex
+        // combination of their Δt-sampled arc-lengths — precisely s_desired.
         auto first_phase_jerk = [](const Profile& pf) {
             if (pf.brake.duration > 0.0) {
                 for (size_t i = 0; i < 2; ++i) {
@@ -976,16 +975,12 @@ class LocalWaypointsCalculator {
         const double j_mix = (1.0 - m) * j_l0 + m * j_u0;
 
         const double dt = dt_goal;
-        const double p_new = p_in + v_in * dt
-                             + 0.5 * a_in * dt * dt
-                             + (j_mix * dt * dt * dt) / 6.0;
-        const double v_new = v_in + a_in * dt + 0.5 * j_mix * dt * dt;
-        const double a_new = a_in + j_mix * dt;
+        p = p_in + v_in * dt + 0.5 * a_in * dt * dt
+            + (j_mix * dt * dt * dt) / 6.0;
+        v = v_in + a_in * dt + 0.5 * j_mix * dt * dt;
+        a = a_in + j_mix * dt;
 
-        // Build a synthetic single-phase profile consistent with (p_new,
-        // v_new, a_new). One phase of duration dt with jerk j_mix captures
-        // the transition exactly; downstream truncate_profile(dt) leaves it
-        // unchanged.
+        // Build a synthetic single-phase profile for reconstruction.
         Profile mixed_profile;
         mixed_profile.t.fill(0.0);
         mixed_profile.j.fill(0.0);
@@ -1017,16 +1012,17 @@ class LocalWaypointsCalculator {
 
         out_profile = mixed_profile;
         out_profile_valid = true;
-        p = mixed_profile.p[7];
-        v = mixed_profile.v[7];
-        a = mixed_profile.a[7];
 
-        // Advance the section if either the upper (the only Ruckig trajectory
-        // that explicitly targets p_end) completes within dt or the mixed
-        // sample has reached p_end along the section direction.
+        // Advance section when the upper trajectory completes within dt
+        // (and we are tracking at full speed) or the position has reached
+        // the section endpoint.
         const bool completed = upper.duration <= dt + 1e-12 && m >= 1.0 - 1e-9;
-        const bool reached_pend = sign * (p - p_end) >= -1e-9;
+        const bool reached_pend = sign * (p - p_end) >= -overshoot_tolerance;
         if (completed || reached_pend) {
+            // Snap state to prevent numerical overshoot from bleeding into
+            // the next section.
+            p = p_end;
+            v = 0.0;
             ++section;
             if (section + 1 >= dp.extrema_pos.size()) finished = true;
         }
@@ -1163,13 +1159,16 @@ class LocalWaypointsCalculator {
         }
 
         // Paper §III-D updates the single path dimension and contiguous time
-        // region whose undershoot of the desired u_ref band causes the largest
-        // integrated position deviation.
+        // region outside the desired ±Δu_ref band that causes the largest
+        // integrated position deviation. We check both undershoot (u < u_ref
+        // - delta) and overshoot (u > u_ref + delta).
         size_t best_d = 0;
         size_t best_lo = 0, best_hi = 0;
         double best_area = 0.0;
+        bool best_is_overshoot = false;
 
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            // --- Undershoot regions (dimension is behind u_ref) ---
             bool in_seg = false;
             size_t seg_start = 0;
             for (size_t k = 0; k <= res.n_steps; ++k) {
@@ -1188,6 +1187,31 @@ class LocalWaypointsCalculator {
                         best_d = d;
                         best_lo = seg_start;
                         best_hi = k - 1;
+                        best_is_overshoot = false;
+                    }
+                    in_seg = false;
+                }
+            }
+
+            // --- Overshoot regions (dimension is ahead of u_ref) ---
+            in_seg = false;
+            for (size_t k = 0; k <= res.n_steps; ++k) {
+                const double upper_bound = (k < res.n_steps) ? std::min(total_u, u_ref[k] + delta) : total_u;
+                const bool active = (k < res.n_steps && res.u_values[d][k] > upper_bound + position_eps);
+                if (active && !in_seg) {
+                    seg_start = k;
+                    in_seg = true;
+                } else if (!active && in_seg) {
+                    double area = 0.0;
+                    for (size_t j = seg_start; j < k; ++j) {
+                        area += pos_dev[j];
+                    }
+                    if (area > best_area) {
+                        best_area = area;
+                        best_d = d;
+                        best_lo = seg_start;
+                        best_hi = k - 1;
+                        best_is_overshoot = true;
                     }
                     in_seg = false;
                 }
@@ -1195,14 +1219,22 @@ class LocalWaypointsCalculator {
         }
         if (best_area <= 0.0) return;
 
-        // Lower u_ref in the selected region so that the offending dimension
-        // lies within the desired lower u_ref band in the next iteration.
-        for (size_t k = best_lo; k <= best_hi; ++k) {
-            u_ref[k] = std::min(u_ref[k], std::min(res.u_values[best_d][k] + delta, total_u));
+        if (best_is_overshoot) {
+            // Raise u_ref in the selected region so the overshooting
+            // dimension lies within the upper u_ref band.
+            for (size_t k = best_lo; k <= best_hi; ++k) {
+                u_ref[k] = std::max(u_ref[k], std::max(res.u_values[best_d][k] - delta, 0.0));
+            }
+        } else {
+            // Lower u_ref in the selected region so the undershooting
+            // dimension lies within the lower u_ref band.
+            for (size_t k = best_lo; k <= best_hi; ++k) {
+                u_ref[k] = std::min(u_ref[k], std::min(res.u_values[best_d][k] + delta, total_u));
+            }
         }
 
         // Keep u_ref monotonic after the local update.
-        for (size_t k = best_lo + 1; k < res.n_steps; ++k) {
+        for (size_t k = 1; k < res.n_steps; ++k) {
             u_ref[k] = std::max(u_ref[k], u_ref[k - 1]);
             u_ref[k] = std::min(u_ref[k], total_u);
         }
@@ -1621,16 +1653,11 @@ public:
         bool post_interrupted = false;
 
         if (align_current) {
-            // Pre-alignment: move from (current_pos, current_vel, current_acc)
-            // toward the first intermediate waypoint (or target if none) while
-            // braking to v=0, a=0. This keeps the alignment trajectory on the
-            // reference path instead of looping back to current_position.
+            // Pre-alignment: brake from (current_vel, current_acc) to v=0,
+            // a=0 at (approximately) the current position. The braking
+            // overshoot is small and the core trajectory then handles the
+            // full path from start through all intermediate waypoints.
             Vector<double> pre_target = input.current_position;
-            if (!input.intermediate_positions.empty()) {
-                pre_target = input.intermediate_positions[0];
-            } else {
-                pre_target = input.target_position;
-            }
 
             const auto pre_input = make_alignment_input(
                 input,
