@@ -1226,28 +1226,59 @@ class LocalWaypointsCalculator {
         build_geometry(input);
         compute_accel_ranges(input);
 
-        // Compute fast and slow section trajectories for each DoF.
-        // These are solved ONCE and then sampled during tracking.
+        // Compute the per-DoF fast trajectories used to seed u_ref. The paper
+        // assumes a small fixed discretization step Δt; in practice, some
+        // sections can be much shorter than 2.5 ms. Adapting Δt to the
+        // shortest non-trivial fast section avoids skipping over these short
+        // sections during online tracking.
         std::vector<std::vector<SectionTrajectory>> fast_trajs(degrees_of_freedom);
         double slowest_t = 0.0;
         size_t slowest = 0;
+        double min_fast_section_duration = std::numeric_limits<double>::infinity();
 
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            if (!input.enabled[d] || dof_paths[d].total_s < position_eps) {
-                // Create trivial trajectory
-                SectionTrajectory trivial;
-                trivial.duration = 0.0;
-                trivial.times = {0.0};
-                trivial.positions = {dof_paths[d].extrema_pos[0]};
-                trivial.velocities = {0.0};
-                trivial.accelerations = {0.0};
-                fast_trajs[d] = {trivial};
-                continue;
+        auto compute_fast_trajectories = [&](double& out_slowest_t,
+                                             size_t& out_slowest,
+                                             double& out_min_fast_section_duration) {
+            out_slowest_t = 0.0;
+            out_slowest = 0;
+            out_min_fast_section_duration = std::numeric_limits<double>::infinity();
+
+            for (size_t d = 0; d < degrees_of_freedom; ++d) {
+                if (!input.enabled[d] || dof_paths[d].total_s < position_eps) {
+                    SectionTrajectory trivial;
+                    trivial.duration = 0.0;
+                    trivial.times = {0.0};
+                    trivial.positions = {dof_paths[d].extrema_pos[0]};
+                    trivial.velocities = {0.0};
+                    trivial.accelerations = {0.0};
+                    fast_trajs[d] = {trivial};
+                    continue;
+                }
+
+                compute_section_trajectories(d, input, true, fast_trajs[d]);
+
+                const double dur = total_duration(fast_trajs[d]);
+                if (dur > out_slowest_t) {
+                    out_slowest_t = dur;
+                    out_slowest = d;
+                }
+
+                for (const auto& sec: fast_trajs[d]) {
+                    if (sec.duration > position_eps) {
+                        out_min_fast_section_duration = std::min(out_min_fast_section_duration, sec.duration);
+                    }
+                }
             }
-            compute_section_trajectories(d, input, true, fast_trajs[d]);
+        };
 
-            double dur = total_duration(fast_trajs[d]);
-            if (dur > slowest_t) { slowest_t = dur; slowest = d; }
+        compute_fast_trajectories(slowest_t, slowest, min_fast_section_duration);
+
+        if (std::isfinite(min_fast_section_duration)) {
+            const double refined_sim_dt = std::min(sim_dt, std::max(1e-4, 0.25 * min_fast_section_duration));
+            if (refined_sim_dt + 1e-15 < sim_dt) {
+                sim_dt = refined_sim_dt;
+                compute_fast_trajectories(slowest_t, slowest, min_fast_section_duration);
+            }
         }
 
         if (slowest_t < sim_dt) {
@@ -1298,42 +1329,18 @@ class LocalWaypointsCalculator {
         // for multi-DoF we iterate and keep the iteration with the lowest
         // average deviation.
         TrackingResult latest = track(input, u_ref, fast_trajs);
-        std::fprintf(stderr, "[local dbg] iter=0 avg_dev=%.6f max_dev=%.6f\n",
-                     latest.avg_deviation, latest.max_deviation);
         TrackingResult best = latest;
         std::vector<double> best_u_ref = u_ref;
         if (degrees_of_freedom > 1) {
             for (int iter = 1; iter < n_tracking_iterations; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
-                std::fprintf(stderr, "[local dbg] iter=%d avg_dev=%.6f max_dev=%.6f\n",
-                             iter, latest.avg_deviation, latest.max_deviation);
                 if (latest.avg_deviation < best.avg_deviation) {
                     best = latest;
                     best_u_ref = u_ref;
                 }
             }
             u_ref = best_u_ref;
-        }
-
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            size_t n_valid_profiles = 0;
-            for (size_t k = 1; k < best.n_steps; ++k) {
-                const Profile& src = best.profiles[d][k];
-                const bool has_profile =
-                    src.t[0] > 0.0 || src.t[1] > 0.0 || src.t[2] > 0.0 ||
-                    src.t[3] > 0.0 || src.t[4] > 0.0 || src.t[5] > 0.0 ||
-                    src.t[6] > 0.0 || src.brake.duration > 0.0;
-                n_valid_profiles += has_profile ? 1 : 0;
-            }
-            std::fprintf(stderr,
-                         "[local dbg] dof=%zu final_tracking p=%.6f v=%.6f a=%.6f valid_profiles=%zu/%zu\n",
-                         d,
-                         best.positions[d].back(),
-                         best.velocities[d].back(),
-                         best.accelerations[d].back(),
-                         n_valid_profiles,
-                         best.n_steps > 0 ? best.n_steps - 1 : 0);
         }
 
         return reconstruct<throw_error>(best, input, traj);
