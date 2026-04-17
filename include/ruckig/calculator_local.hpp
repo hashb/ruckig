@@ -125,6 +125,35 @@ class LocalWaypointsCalculator {
                == Result::Working;
     }
 
+    //! Braking trajectory in velocity control mode: bring the DoF to
+    //! (v=0, a=0) as quickly as the jerk limit allows, regardless of
+    //! position. This is the paper's "lower trajectory" at the start of
+    //! a section (§III-C).
+    bool solve_brake(double p0, double v0, double a0,
+                     const DofLimits& lim) {
+        bs_input.current_position[0] = p0;
+        bs_input.current_velocity[0] = v0;
+        bs_input.current_acceleration[0] = a0;
+        bs_input.target_position[0] = p0;
+        bs_input.target_velocity[0] = 0.0;
+        bs_input.target_acceleration[0] = 0.0;
+        bs_input.max_velocity[0] = lim.vmax;
+        bs_input.max_acceleration[0] = lim.amax;
+        bs_input.max_jerk[0] = lim.jmax;
+        (*bs_input.min_velocity)[0] = lim.vmin;
+        (*bs_input.min_acceleration)[0] = lim.amin;
+        bs_input.enabled[0] = true;
+        bs_input.control_interface = ControlInterface::Velocity;
+        bs_input.synchronization = Synchronization::Time;
+        bs_input.duration_discretization = DurationDiscretization::Continuous;
+        bs_input.minimum_duration = std::nullopt;
+        bool interrupted = false;
+        bool ok = bs_calc.template calculate<false>(bs_input, bs_traj, 0.0, interrupted)
+                  == Result::Working;
+        bs_input.control_interface = ControlInterface::Position;
+        return ok;
+    }
+
     void sample_traj(const Trajectory<0, StandardVector>& t, double time,
                      double& p, double& v, double& a) {
         std::vector<double> pp(1), vv(1), aa(1);
@@ -841,52 +870,73 @@ class LocalWaypointsCalculator {
             return;
         }
 
-        double af_upper = dp.accel_fast[section + 1];
+        const double af_upper_nominal = dp.accel_fast[section + 1];
         const double p_in = p, v_in = v, a_in = a;
 
-        // Upper probe – must stay on the current 1-D section (position bounds
-        // only; velocity may be non-zero during online tracking).
-        bool upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)
-                        && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
-        if (!upper_ok) {
-            upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim)
-                       && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
-            if (upper_ok) af_upper = 0.0;
-        }
-        if (!upper_ok) return;
-        bs_traj_upper = bs_traj;
-        double s_u;
-        {
-            double p_u_step, v_u_step, a_u_step;
-            sample_traj(bs_traj_upper, dt_goal, p_u_step, v_u_step, a_u_step);
-            s_u = forward_position_to_s(d, section, p_u_step);
+        struct Candidate {
+            bool ok {false};
+            double s_dt {0.0};
+            double p_dt {0.0};
+            double v_dt {0.0};
+            double a_dt {0.0};
+            Profile profile;
+            double duration {0.0};
+        };
+
+        auto sample_into = [&](Candidate& c) {
+            c.ok = true;
+            c.duration = bs_traj.get_duration();
+            c.profile = bs_traj.profiles[0][0];
+            sample_traj(bs_traj, dt_goal, c.p_dt, c.v_dt, c.a_dt);
+            c.s_dt = forward_position_to_s(d, section, c.p_dt);
+        };
+
+        // --- Upper (fast) trajectory: position control to (p_end, 0, af_fast).
+        double af_upper = af_upper_nominal;
+        Candidate upper{};
+        if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)
+            && trajectory_stays_on_section(bs_traj, p_start, p_end, false)) {
+            sample_into(upper);
+        } else if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim)
+                   && trajectory_stays_on_section(bs_traj, p_start, p_end, false)) {
+            af_upper = 0.0;
+            sample_into(upper);
         }
 
-        // Lower probe: start with a braking trajectory. If it overshoots or
-        // leaves the section, find the smallest feasible target acceleration
-        // a_min as in §III-C.
-        double af_lower = 0.0;
-        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim)
-                        && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
-        if (!lower_ok) {
-            const double af_upper_mag = std::abs(af_upper);
+        // --- Lower (slow/brake) trajectory. Per paper §III-C: start with a
+        // pure velocity-control brake (target v=0, a=0). Only if the brake
+        // overshoots the section end, fall back to a position-control solve
+        // with the smallest feasible positive target acceleration.
+        Candidate lower{};
+        const double brake_bound_lo = std::min(p_start, p_end) - overshoot_tolerance;
+        const double brake_bound_hi = std::max(p_start, p_end) + overshoot_tolerance;
+
+        bool brake_valid = false;
+        if (solve_brake(p_in, v_in, a_in, lim)) {
+            const Profile& brake_prof = bs_traj.profiles[0][0];
+            const Bound ext = brake_prof.get_position_extrema();
+            if (ext.min >= brake_bound_lo && ext.max <= brake_bound_hi) {
+                brake_valid = true;
+                sample_into(lower);
+            }
+        }
+        if (!brake_valid) {
+            const double af_ref_mag = upper.ok ? std::abs(af_upper) : std::abs(af_upper_nominal);
             const double amin_mag = find_min_online_target_a(
-                p_in, v_in, a_in, p_end, sign, lim, af_upper_mag
+                p_in, v_in, a_in, p_end, sign, lim, af_ref_mag
             );
-            af_lower = sign * amin_mag;
-            lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
-        }
-        if (!lower_ok) return;
-        double s_l;
-        {
-            double p_l_step, v_l_step, a_l_step;
-            sample_traj(bs_traj, dt_goal, p_l_step, v_l_step, a_l_step);
-            s_l = forward_position_to_s(d, section, p_l_step);
+            if (solve_1dof(p_in, v_in, a_in, p_end, 0.0, sign * amin_mag, lim)) {
+                sample_into(lower);
+            }
         }
 
-        // Compute mapping factor m ∈ [0, 1] so that the sampled arc-length
-        // at Δt interpolates between lower (m=0) and upper (m=1) trajectories
-        // to match s_target as closely as possible (paper §III-C Eq. 5).
+        if (!upper.ok && !lower.ok) return;
+        if (!upper.ok) upper = lower;
+        if (!lower.ok) lower = upper;
+
+        // --- Mapping factor m ∈ [0, 1] (paper Eq. 5).
+        const double s_u = upper.s_dt;
+        const double s_l = lower.s_dt;
         const double s_range = s_u - s_l;
         double m;
         if (s_range > position_eps) {
@@ -896,32 +946,86 @@ class LocalWaypointsCalculator {
             m = (s_target >= 0.5 * (s_u + s_l) - position_eps) ? 1.0 : 0.0;
         }
 
-        // Interpolated target acceleration: af_lower at m=0, af_upper at m=1.
-        const double af_interp = af_lower + m * (af_upper - af_lower);
-
-        // Solve the intermediate trajectory with the interpolated target accel.
-        if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_interp, lim)) {
-            // Fallback: try the nearer valid endpoint.
-            if (m >= 0.5) {
-                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim) &&
-                    !solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim)) {
-                    return;
-                }
-            } else {
-                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim) &&
-                    !solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)) {
-                    return;
+        // --- Intermediate trajectory (paper §III-C). Using a continuous
+        // mapping factor m requires an actual intermediate trajectory whose
+        // first-dt progress matches s_desired = s_l + m·(s_u − s_l).
+        //
+        // Exploit the fact that for small dt, both upper and lower are in
+        // their first jerk phase, and the resulting kinematic state is a
+        // polynomial in the applied jerk. A convex combination of upper's
+        // and lower's first-phase jerks, applied for one dt from the current
+        // state, produces the convex combination of their Δt-sampled
+        // kinematic states — precisely s_desired.
+        //
+        // The single mixed jerk stays inside [min(j_l,j_u), max(j_l,j_u)]
+        // ⊂ [-j_max, j_max], and the resulting v and a are convex
+        // combinations of feasible states, so all limits remain satisfied.
+        auto first_phase_jerk = [](const Profile& pf) {
+            if (pf.brake.duration > 0.0) {
+                for (size_t i = 0; i < 2; ++i) {
+                    if (pf.brake.t[i] > 0.0) return pf.brake.j[i];
                 }
             }
+            for (size_t i = 0; i < 7; ++i) {
+                if (pf.t[i] > 0.0) return pf.j[i];
+            }
+            return 0.0;
+        };
+        const double j_u0 = first_phase_jerk(upper.profile);
+        const double j_l0 = first_phase_jerk(lower.profile);
+        const double j_mix = (1.0 - m) * j_l0 + m * j_u0;
+
+        const double dt = dt_goal;
+        const double p_new = p_in + v_in * dt
+                             + 0.5 * a_in * dt * dt
+                             + (j_mix * dt * dt * dt) / 6.0;
+        const double v_new = v_in + a_in * dt + 0.5 * j_mix * dt * dt;
+        const double a_new = a_in + j_mix * dt;
+
+        // Build a synthetic single-phase profile consistent with (p_new,
+        // v_new, a_new). One phase of duration dt with jerk j_mix captures
+        // the transition exactly; downstream truncate_profile(dt) leaves it
+        // unchanged.
+        Profile mixed_profile;
+        mixed_profile.t.fill(0.0);
+        mixed_profile.j.fill(0.0);
+        mixed_profile.t[0] = dt;
+        mixed_profile.j[0] = j_mix;
+        mixed_profile.p[0] = p_in;
+        mixed_profile.v[0] = v_in;
+        mixed_profile.a[0] = a_in;
+        for (size_t i = 0; i < 7; ++i) {
+            mixed_profile.a[i+1] = mixed_profile.a[i] + mixed_profile.t[i] * mixed_profile.j[i];
+            mixed_profile.v[i+1] = mixed_profile.v[i]
+                + mixed_profile.t[i] * (mixed_profile.a[i]
+                                         + mixed_profile.t[i] * mixed_profile.j[i] / 2.0);
+            mixed_profile.p[i+1] = mixed_profile.p[i]
+                + mixed_profile.t[i] * (mixed_profile.v[i]
+                                         + mixed_profile.t[i] * (mixed_profile.a[i] / 2.0
+                                                                  + mixed_profile.t[i] * mixed_profile.j[i] / 6.0));
         }
+        mixed_profile.t_sum[0] = mixed_profile.t[0];
+        for (size_t i = 1; i < 7; ++i)
+            mixed_profile.t_sum[i] = mixed_profile.t_sum[i-1] + mixed_profile.t[i];
+        mixed_profile.pf = mixed_profile.p[7];
+        mixed_profile.vf = mixed_profile.v[7];
+        mixed_profile.af = mixed_profile.a[7];
+        mixed_profile.brake.duration = 0.0;
+        mixed_profile.brake.t[0] = 0.0; mixed_profile.brake.t[1] = 0.0;
+        mixed_profile.accel.duration = 0.0;
+        mixed_profile.accel.t[0] = 0.0; mixed_profile.accel.t[1] = 0.0;
 
-        const double T_i = bs_traj.get_duration();
-        out_profile = bs_traj.profiles[0][0];
+        out_profile = mixed_profile;
         out_profile_valid = true;
-        sample_traj(bs_traj, dt_goal, p, v, a);
+        p = mixed_profile.p[7];
+        v = mixed_profile.v[7];
+        a = mixed_profile.a[7];
 
-        const bool completed = T_i <= dt_goal + 1e-12;
-        const bool reached_pend = sign * (p - p_end) >= -1e-12;
+        // Advance the section if either the upper (the only Ruckig trajectory
+        // that explicitly targets p_end) completes within dt or the mixed
+        // sample has reached p_end along the section direction.
+        const bool completed = upper.duration <= dt + 1e-12 && m >= 1.0 - 1e-9;
+        const bool reached_pend = sign * (p - p_end) >= -1e-9;
         if (completed || reached_pend) {
             ++section;
             if (section + 1 >= dp.extrema_pos.size()) finished = true;
@@ -1359,12 +1463,18 @@ class LocalWaypointsCalculator {
         compute_fast_trajectories(slowest_t, slowest, min_fast_section_duration);
 
         if (std::isfinite(min_fast_section_duration)) {
-            const double refined_sim_dt = std::min(sim_dt, std::max(1e-4, 0.25 * min_fast_section_duration));
+            // Paper uses Δt = 2.5 ms. Cap the adaptive reduction so that the
+            // lower/upper probes still produce a measurable s_u − s_l gap
+            // within one step — otherwise the mapping factor m loses all
+            // resolution and the tracker can't choose meaningfully between
+            // brake and sprint.
+            const double refined_sim_dt = std::min(sim_dt, std::max(1e-3, 0.25 * min_fast_section_duration));
             if (refined_sim_dt + 1e-15 < sim_dt) {
                 sim_dt = refined_sim_dt;
                 compute_fast_trajectories(slowest_t, slowest, min_fast_section_duration);
             }
         }
+        std::fprintf(stderr, "[local] sim_dt=%.6f min_fast_sec_dur=%.6f slowest=%zu\n", sim_dt, min_fast_section_duration, slowest);
 
         if (slowest_t < sim_dt) {
             // Trivial: direct solve
@@ -1416,10 +1526,26 @@ class LocalWaypointsCalculator {
         TrackingResult latest = track(input, u_ref, fast_trajs);
         TrackingResult best = latest;
         std::vector<double> best_u_ref = u_ref;
+        std::fprintf(stderr, "[local] sim_dt=%.6f n_steps=%zu total_u=%.4f\n", sim_dt, latest.n_steps, total_u);
+        // Print d=0 at a few key indices
+        auto dump = [&](const TrackingResult& r, const std::vector<double>& ur, int iter){
+            size_t N = r.n_steps;
+            size_t idx[6] = {0, N/5, 2*N/5, 3*N/5, 4*N/5, N-1};
+            std::fprintf(stderr, "[local] iter=%d:\n", iter);
+            for (size_t i : idx) {
+                std::fprintf(stderr, "  k=%zu u_ref=%.4f | d0 p=%.4f u=%.4f | d1 p=%.4f u=%.4f | d2 p=%.4f u=%.4f\n",
+                    i, ur[i],
+                    r.positions[0][i], r.u_values[0][i],
+                    r.positions[1][i], r.u_values[1][i],
+                    r.positions[2][i], r.u_values[2][i]);
+            }
+        };
+        dump(latest, u_ref, 0);
         if (degrees_of_freedom > 1) {
             for (int iter = 1; iter < n_tracking_iterations; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
+                if (iter <= 2 || iter == n_tracking_iterations - 1) dump(latest, u_ref, iter);
                 if (latest.avg_path_deviation < best.avg_path_deviation) {
                     best = latest;
                     best_u_ref = u_ref;
