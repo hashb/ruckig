@@ -132,16 +132,49 @@ class LocalWaypointsCalculator {
         p = pp[0]; v = vv[0]; a = aa[0];
     }
 
+    //! Check that a solved 1-DoF trajectory stays within the position bounds
+    //! [min(p0,pf), max(p0,pf)] AND (when check_velocity_sign is true) that
+    //! velocity never reverses sign relative to the section direction.
+    //!
+    //! The velocity-sign check implements the paper §III-B validity criterion
+    //! and should be enabled when both endpoints have v=0 (the binary-search
+    //! context). When the trajectory starts or ends with non-zero velocity,
+    //! a velocity sign reversal may be physically required to brake and then
+    //! proceed, so only position bounds are checked.
+    bool trajectory_stays_on_section(const Trajectory<0, StandardVector>& traj,
+                                     double p0, double pf,
+                                     bool check_velocity_sign = true) const {
+        const Profile& prof = traj.profiles[0][0];
+        const Bound extrema = prof.get_position_extrema();
+        const double p_low = std::min(p0, pf);
+        const double p_high = std::max(p0, pf);
+        if (extrema.min < p_low - overshoot_tolerance
+            || extrema.max > p_high + overshoot_tolerance) {
+            return false;
+        }
+
+        if (!check_velocity_sign) return true;
+
+        // Check velocity never reverses sign against the section direction.
+        const double sign = (pf >= p0) ? 1.0 : -1.0;
+        const double T = traj.get_duration();
+        if (T < 1e-15) return true;
+
+        const double dense_dt = std::max(T / 100.0, 1e-6);
+        for (double t = 0.0; t <= T + 1e-12; t += dense_dt) {
+            std::vector<double> pv(1), vv(1), av(1);
+            traj.at_time(std::min(t, T), pv, vv, av);
+            if (sign > 0.0 && vv[0] < -overshoot_tolerance) return false;
+            if (sign < 0.0 && vv[0] > overshoot_tolerance) return false;
+        }
+        return true;
+    }
+
     bool test_segment(double p0, double v0, double a0,
                       double pf, double vf, double af,
                       const DofLimits& lim) {
         if (!solve_1dof(p0, v0, a0, pf, vf, af, lim)) return false;
-        const Profile& prof = bs_traj.profiles[0][0];
-        const Bound extrema = prof.get_position_extrema();
-        const double p_low = std::min(p0, pf);
-        const double p_high = std::max(p0, pf);
-        return extrema.min >= p_low - overshoot_tolerance
-            && extrema.max <= p_high + overshoot_tolerance;
+        return trajectory_stays_on_section(bs_traj, p0, pf);
     }
 
     double find_max_a(double p_from, double p_to, double sign, bool is_target,
@@ -811,24 +844,30 @@ class LocalWaypointsCalculator {
         double af_upper = dp.accel_fast[section + 1];
         const double p_in = p, v_in = v, a_in = a;
 
-        // Upper probe.
-        bool upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim);
+        // Upper probe – must stay on the current 1-D section (position bounds
+        // only; velocity may be non-zero during online tracking).
+        bool upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim)
+                        && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
         if (!upper_ok) {
-            upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+            upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim)
+                       && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
             if (upper_ok) af_upper = 0.0;
         }
         if (!upper_ok) return;
+        bs_traj_upper = bs_traj;
         double s_u;
         {
             double p_u_step, v_u_step, a_u_step;
-            sample_traj(bs_traj, dt_goal, p_u_step, v_u_step, a_u_step);
+            sample_traj(bs_traj_upper, dt_goal, p_u_step, v_u_step, a_u_step);
             s_u = forward_position_to_s(d, section, p_u_step);
         }
 
-        // Lower probe: start with a braking trajectory. If it overshoots, find
-        // the smallest feasible target acceleration a_min as in §III-C.
+        // Lower probe: start with a braking trajectory. If it overshoots or
+        // leaves the section, find the smallest feasible target acceleration
+        // a_min as in §III-C.
         double af_lower = 0.0;
-        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
+        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim)
+                        && trajectory_stays_on_section(bs_traj, p_start, p_end, false);
         if (!lower_ok) {
             const double af_upper_mag = std::abs(af_upper);
             const double amin_mag = find_min_online_target_a(
@@ -1456,12 +1495,23 @@ public:
         bool post_interrupted = false;
 
         if (align_current) {
+            // Pre-alignment: move from (current_pos, current_vel, current_acc)
+            // toward the first intermediate waypoint (or target if none) while
+            // braking to v=0, a=0. This keeps the alignment trajectory on the
+            // reference path instead of looping back to current_position.
+            Vector<double> pre_target = input.current_position;
+            if (!input.intermediate_positions.empty()) {
+                pre_target = input.intermediate_positions[0];
+            } else {
+                pre_target = input.target_position;
+            }
+
             const auto pre_input = make_alignment_input(
                 input,
                 input.current_position,
                 input.current_velocity,
                 input.current_acceleration,
-                input.current_position,
+                pre_target,
                 zero_velocity,
                 zero_acceleration
             );
