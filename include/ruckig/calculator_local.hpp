@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -46,6 +47,7 @@ class LocalWaypointsCalculator {
     TargetCalculator<0, StandardVector> bs_calc;
     InputParameter<0, StandardVector> bs_input;
     Trajectory<0, StandardVector> bs_traj;
+    Trajectory<0, StandardVector> bs_traj_upper;
 
     static constexpr int binary_search_iterations {16};
     static constexpr double overshoot_tolerance {1e-9};
@@ -54,6 +56,10 @@ class LocalWaypointsCalculator {
     static constexpr double delta_u_ref_fraction {0.02};
 
     double sim_dt {0.0025};
+    // Trace-dump hooks (d=0 diagnostics).
+    double g_trc_last_T_u {0.0}, g_trc_last_T_l {0.0}, g_trc_last_T_i {0.0};
+    double g_trc_last_m {0.0}, g_trc_last_af_interp {0.0}, g_trc_last_af_upper {0.0};
+    double g_trc_last_sl {0.0}, g_trc_last_su {0.0};
 
     struct DofLimits {
         double vmax, vmin, amax, amin, jmax;
@@ -286,13 +292,13 @@ class LocalWaypointsCalculator {
     }
 
     //! Solve a complete 1-D section and sample it at dt intervals.
-    //! The section goes from (p0, v0, a0) to (pf, 0, af).
+    //! The section goes from (p0, v0, a0) to (pf, vf, af).
     SectionTrajectory solve_and_sample_section(double p0, double v0, double a0,
-                                                double pf, double af,
+                                                double pf, double vf, double af,
                                                 const DofLimits& lim) {
         SectionTrajectory st;
-        if (!solve_1dof(p0, v0, a0, pf, 0.0, af, lim)) {
-            // Fallback: zero target accel
+        if (!solve_1dof(p0, v0, a0, pf, vf, af, lim)) {
+            // Fallback: zero target v/accel
             if (!solve_1dof(p0, v0, a0, pf, 0.0, 0.0, lim)) {
                 st.duration = 0.0;
                 st.times = {0.0};
@@ -339,18 +345,21 @@ class LocalWaypointsCalculator {
         double a0 = input.current_acceleration[d];
 
         for (size_t s = 0; s < n_sec; ++s) {
+            bool is_last = (s + 1 == n_sec);
             double p0 = dp.extrema_pos[s];
             double pf = dp.extrema_pos[s+1];
-            double af = use_fast ? dp.accel_fast[s+1] : 0.0;
+            double vf = is_last ? input.target_velocity[d] : 0.0;
+            double af = is_last ? input.target_acceleration[d]
+                                : (use_fast ? dp.accel_fast[s+1] : 0.0);
 
-            trajs[s] = solve_and_sample_section(p0, v0, a0, pf, af, dof_limits[d]);
+            trajs[s] = solve_and_sample_section(p0, v0, a0, pf, vf, af, dof_limits[d]);
 
             // Next section starts from the end state of this section
             if (!trajs[s].positions.empty()) {
                 v0 = trajs[s].velocities.back();
                 a0 = trajs[s].accelerations.back();
             } else {
-                v0 = 0.0;
+                v0 = vf;
                 a0 = af;
             }
         }
@@ -523,22 +532,274 @@ class LocalWaypointsCalculator {
         std::vector<std::vector<double>> positions;   // [dof][step]
         std::vector<std::vector<double>> velocities;
         std::vector<std::vector<double>> accelerations;
+        //! Full Ruckig profile (intermediate solve) that governs the transition
+        //! from step k−1 to step k, per DoF. Index [d][k] stores the profile
+        //! consumed during sim step k (so [d][0] is unused). Reconstruction
+        //! truncates each profile to sim_dt, preserving any phase transitions
+        //! that fall inside the sim step — storing only j[0] would mis-represent
+        //! sim steps where a phase boundary lies in [0, sim_dt).
+        std::vector<std::vector<Profile>> profiles;
         size_t n_steps {0};
         double total_time {0.0};
         double max_deviation {0.0};
         double avg_deviation {0.0};
     };
 
-    //! Run one tracking iteration.
+    //! Build a Ruckig-style Profile that represents exactly the first `dur`
+    //! seconds of `src`, treating src's pre-trajectory brake and its main
+    //! 7-phase body as a single logical sequence (brake phases first, then
+    //! main phases). When Ruckig determines the input state violates a
+    //! predictive limit (e.g. a > 0 and v_at_a_zero > v_max), it inserts a
+    //! pre-trajectory brake sub-profile before the main profile — so
+    //! Trajectory::at_time(t) samples the brake for t < brake.duration and
+    //! the main profile for t ∈ [brake.duration, brake.duration + t_sum[6]].
+    //! If we stored only the main profile (zeroing brake.duration), every
+    //! sim-step that falls inside a brake window would emit a profile whose
+    //! p[0] = post-brake state rather than the actual input state — creating
+    //! position/velocity/acceleration jumps of up to the brake's traversal
+    //! when the reconstructed trajectory is re-sampled.
     //!
-    //! Paper §III-C/D: for each DoF, the mapping factor m operates in per-DoF
-    //! s-space (Eq. 5), and the position is looked up from the path geometry
-    //! at the interpolated path length.  Velocity and acceleration are
-    //! interpolated between the fast/slow trajectory states to stay within
-    //! kinematically feasible bounds.
+    //! Strategy: concatenate brake (up to 2 phases) and main (up to 7 phases)
+    //! into one linear list of (t,j) pairs, truncate to `dur`, and pack back
+    //! into the 7-phase Profile layout. For typical Ruckig outputs the union
+    //! of active phases is <= 7, so no information is lost; if the rare case
+    //! of >7 active phases within a sim step arises, we truncate at dur
+    //! before exhausting the list.
+    static void truncate_profile(Profile& p, double dur) {
+        // Gather (t, j) phases from brake, then main, skipping zero-duration.
+        std::array<double, 9> pt{}, pj{};
+        size_t n_phase = 0;
+        double p0 {0.0}, v0 {0.0}, a0 {0.0};
+        if (p.brake.duration > 0.0) {
+            p0 = p.brake.p[0];
+            v0 = p.brake.v[0];
+            a0 = p.brake.a[0];
+            for (size_t i = 0; i < 2; ++i) {
+                if (p.brake.t[i] > 0.0) {
+                    pt[n_phase] = p.brake.t[i];
+                    pj[n_phase] = p.brake.j[i];
+                    ++n_phase;
+                }
+            }
+        } else {
+            p0 = p.p[0];
+            v0 = p.v[0];
+            a0 = p.a[0];
+        }
+        for (size_t i = 0; i < 7; ++i) {
+            if (p.t[i] > 0.0) {
+                pt[n_phase] = p.t[i];
+                pj[n_phase] = p.j[i];
+                ++n_phase;
+            }
+        }
+
+        // Truncate to `dur`.
+        std::array<double, 7> kept_t{}, kept_j{};
+        size_t n_kept = 0;
+        double remaining = dur;
+        for (size_t i = 0; i < n_phase && n_kept < 7; ++i) {
+            if (pt[i] >= remaining - 1e-15) {
+                kept_t[n_kept] = remaining;
+                kept_j[n_kept] = pj[i];
+                ++n_kept;
+                remaining = 0.0;
+                break;
+            }
+            kept_t[n_kept] = pt[i];
+            kept_j[n_kept] = pj[i];
+            ++n_kept;
+            remaining -= pt[i];
+        }
+        if (remaining > 1e-15 && n_kept < 7) {
+            // Merged profile shorter than dur → coast with zero jerk.
+            kept_t[n_kept] = remaining;
+            kept_j[n_kept] = 0.0;
+            ++n_kept;
+        }
+
+        // Write back into the 7-phase Profile layout.
+        for (size_t i = 0; i < 7; ++i) {
+            p.t[i] = (i < n_kept) ? kept_t[i] : 0.0;
+            p.j[i] = (i < n_kept) ? kept_j[i] : 0.0;
+        }
+        p.p[0] = p0;
+        p.v[0] = v0;
+        p.a[0] = a0;
+        p.t_sum[0] = p.t[0];
+        for (size_t i = 1; i < 7; ++i) p.t_sum[i] = p.t_sum[i-1] + p.t[i];
+        for (size_t i = 0; i < 7; ++i) {
+            p.a[i+1] = p.a[i] + p.t[i] * p.j[i];
+            p.v[i+1] = p.v[i] + p.t[i] * (p.a[i] + p.t[i] * p.j[i] / 2.0);
+            p.p[i+1] = p.p[i] + p.t[i] * (p.v[i] + p.t[i] * (p.a[i] / 2.0 + p.t[i] * p.j[i] / 6.0));
+        }
+        p.pf = p.p[7];
+        p.vf = p.v[7];
+        p.af = p.a[7];
+        p.brake.duration = 0.0;
+        p.brake.t[0] = 0.0; p.brake.t[1] = 0.0;
+        p.accel.duration = 0.0;
+        p.accel.t[0] = 0.0; p.accel.t[1] = 0.0;
+    }
+
+    //! Advance one DoF by exactly one simulation step (dt_goal) using the
+    //! paper's online scheme (§III-C). Exactly ONE Ruckig solve is consumed
+    //! per call so the returned first-phase jerk alone determines the full
+    //! state transition — no mid-step section crossings, no mixing of jerks.
+    //!
+    //!   1. Solve upper trajectory to (p_end, 0, af_upper), sample at dt → s_U.
+    //!   2. Solve lower trajectory to (p_end, 0, 0),        sample at dt → s_L.
+    //!   3. Choose m ∈ [0,1] so that s_desired = s_L + m·(s_U - s_L) matches
+    //!      the arc-length target s_target derived from u_ref.
+    //!   4. Solve the intermediate trajectory to (p_end, 0, m·af_upper) and
+    //!      sample at dt. This state is a Ruckig-trajectory prefix, so the
+    //!      transition respects v_max, a_max, and j_max. The section index
+    //!      is advanced if the sampled position reached p_end, but no further
+    //!      advance is done in the same call.
+    void advance_one_dof(size_t d,
+                         double& p, double& v, double& a,
+                         Profile& out_profile,
+                         bool& out_profile_valid,
+                         size_t& section,
+                         bool& finished,
+                         double dt_goal,
+                         double s_target,
+                         double target_v, double target_a,
+                         double time_remaining_in_sim) {
+        out_profile_valid = false;
+        if (finished) return;
+
+        const auto& dp = dof_paths[d];
+        const auto& lim = dof_limits[d];
+
+        // Skip any zero-length sections without consuming time.
+        while (section + 1 < dp.extrema_pos.size()
+               && std::abs(dp.extrema_pos[section + 1] - dp.extrema_pos[section])
+                  < position_eps) {
+            ++section;
+        }
+        if (section + 1 >= dp.extrema_pos.size()) {
+            finished = true;
+            return;
+        }
+
+        const double p_start = dp.extrema_pos[section];
+        const double p_end   = dp.extrema_pos[section + 1];
+        const bool is_last   = (section + 2 == dp.extrema_pos.size());
+        const double sign = (p_end >= p_start) ? 1.0 : -1.0;
+
+        if (is_last) {
+            const double min_dur = std::max(time_remaining_in_sim, 0.0);
+            bool ok = solve_1dof(p, v, a, p_end, target_v, target_a, lim,
+                                  (min_dur > 1e-12) ? std::optional<double>(min_dur)
+                                                    : std::nullopt);
+            if (!ok) ok = solve_1dof(p, v, a, p_end, target_v, target_a, lim);
+            if (!ok) ok = solve_1dof(p, v, a, p_end, 0.0, 0.0, lim);
+            if (!ok) return;
+
+            const double T = bs_traj.get_duration();
+            out_profile = bs_traj.profiles[0][0];
+            out_profile_valid = true;
+            // Always sample at dt_goal so the tracked state matches what the
+            // stored profile will produce under coast-after-end semantics.
+            double pp, vv, aa;
+            sample_traj(bs_traj, dt_goal, pp, vv, aa);
+            p = pp; v = vv; a = aa;
+            if (dt_goal >= T - 1e-12) {
+                finished = true;
+            }
+            return;
+        }
+
+        double af_upper = dp.accel_fast[section + 1];
+        const double p_in = p, v_in = v, a_in = a;
+
+        // Upper probe.
+        bool upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_upper, lim);
+        if (!upper_ok) {
+            upper_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+            if (upper_ok) af_upper = 0.0;
+        }
+        if (!upper_ok) return;
+        const double T_u = bs_traj.get_duration();
+        const double step = std::min(dt_goal, T_u);
+        double p_u, v_u, a_u;
+        sample_traj(bs_traj, step, p_u, v_u, a_u);
+        const double s_u = dp.cum_s[section] + sign * (p_u - p_start);
+
+        // Lower probe.
+        bool lower_ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+        if (!lower_ok) return;
+        const double T_l = bs_traj.get_duration();
+        double p_l, v_l, a_l;
+        sample_traj(bs_traj, std::min(dt_goal, T_l), p_l, v_l, a_l);
+        const double s_l = dp.cum_s[section] + sign * (p_l - p_start);
+
+        // Mapping factor m from s_target.
+        double m;
+        const double ds = s_u - s_l;
+        if (ds < 1e-15 || s_target >= s_u) {
+            m = 1.0;
+        } else if (s_target <= s_l) {
+            m = 0.0;
+        } else {
+            m = (s_target - s_l) / ds;
+            m = std::min(std::max(m, 0.0), 1.0);
+        }
+
+        // Intermediate trajectory: target accel = m · af_upper.
+        const double af_interp = m * af_upper;
+        bool ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_interp, lim);
+        if (!ok) ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, 0.0, lim);
+        if (!ok) return;
+
+        const double T_i = bs_traj.get_duration();
+        out_profile = bs_traj.profiles[0][0];
+        out_profile_valid = true;
+        // Always sample at dt_goal. If T_i < dt, Ruckig at_time(t > T) coasts
+        // with j=0 past the profile end, which truncate_profile replicates
+        // with a zero-jerk extension slot — the two representations match
+        // exactly. Snapping to (p_end, 0, af_interp) here would desync
+        // tracking-state from stored-profile end-state and manufacture
+        // spurious position/velocity jumps at micro-segment boundaries.
+        double pp, vv, aa;
+        sample_traj(bs_traj, dt_goal, pp, vv, aa);
+        g_trc_last_T_u = T_u;
+        g_trc_last_T_l = T_l;
+        g_trc_last_T_i = T_i;
+        g_trc_last_m = m;
+        g_trc_last_af_interp = af_interp;
+        g_trc_last_af_upper = af_upper;
+        g_trc_last_sl = s_l;
+        g_trc_last_su = s_u;
+        p = pp; v = vv; a = aa;
+
+        // Section advance: the intermediate Ruckig profile either (a) physically
+        // completed within this sim step (T_i ≤ dt, sampled state is coasted
+        // past target in next-section direction), or (b) the sampled position
+        // has already crossed p_end in the travel direction (reached_pend).
+        // Both imply we have left the current section — no state snapping here,
+        // the Ruckig sample is authoritative.
+        const bool completed = T_i <= dt_goal + 1e-12;
+        const bool reached_pend = sign * (p - p_end) >= -1e-12;
+        if (completed || reached_pend) {
+            ++section;
+            if (section + 1 >= dp.extrema_pos.size()) finished = true;
+        }
+    }
+
+    //! Run one tracking iteration using the online algorithm from §III-C/D.
+    //!
+    //! For every simulation step Δt and every DoF, we solve a fresh Ruckig
+    //! upper/lower trajectory pair from the current state to the end of the
+    //! current per-DoF section and mix their Δt-sampled states with the
+    //! mapping factor m (Eq. 5) chosen so the per-DoF arc length matches
+    //! s_target := u_to_s_for_dof(d, u_ref[k]). Because both trajectories
+    //! start from the SAME state, the mixed state is kinematically feasible
+    //! (convex combination of jerk profiles remains within bounds).
     TrackingResult track(const InputParameter<DOFs, CustomVector>& input,
                          const std::vector<double>& u_ref,
-                         const std::vector<std::vector<SectionTrajectory>>& fast_trajs) {
+                         const std::vector<std::vector<SectionTrajectory>>& /*fast_trajs*/) {
         const size_t n_steps = u_ref.size();
         TrackingResult res;
         res.n_steps = n_steps;
@@ -546,41 +807,64 @@ class LocalWaypointsCalculator {
         res.positions.resize(degrees_of_freedom);
         res.velocities.resize(degrees_of_freedom);
         res.accelerations.resize(degrees_of_freedom);
+        res.profiles.resize(degrees_of_freedom);
+
+        std::vector<double> p_cur(degrees_of_freedom), v_cur(degrees_of_freedom), a_cur(degrees_of_freedom);
+        std::vector<size_t> section_cur(degrees_of_freedom, 0);
+        std::vector<char> finished(degrees_of_freedom, 0);
 
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             res.positions[d].resize(n_steps);
             res.velocities[d].resize(n_steps);
             res.accelerations[d].resize(n_steps);
+            res.profiles[d].resize(n_steps);
 
-            const auto& ft = fast_trajs[d];
-            const double dur_fast = total_duration(ft);
+            p_cur[d] = input.current_position[d];
+            v_cur[d] = input.current_velocity[d];
+            a_cur[d] = input.current_acceleration[d];
+            res.positions[d][0]     = p_cur[d];
+            res.velocities[d][0]    = v_cur[d];
+            res.accelerations[d][0] = a_cur[d];
+            finished[d] = (!input.enabled[d] || dof_paths[d].total_s < position_eps) ? 1 : 0;
+        }
 
-            for (size_t k = 0; k < n_steps; ++k) {
-                // Position: directly from the reference path at u_ref.
-                // This places every DoF exactly on the reference polyline
-                // at the progress dictated by u_ref, eliminating
-                // synchronisation-induced path deviation.
-                double s_target = u_to_s_for_dof(d, u_ref[k]);
-                res.positions[d][k] = s_to_position(d, s_target);
-
-                // Velocity and acceleration: sample the fast trajectory
-                // at the time whose progress equals s_target, giving
-                // kinematically feasible v/a from an actual Ruckig
-                // solution.  We approximate by linearly mapping
-                // s_target/total_s → t within [0, dur_fast].
-                double s_total = dof_paths[d].total_s;
-                double frac = (s_total > position_eps)
-                              ? std::min(s_target / s_total, 1.0) : 1.0;
-                double t_approx = frac * dur_fast;
-
-                double p_tmp, v_tmp, a_tmp, s_tmp;
-                sample_section_seq(ft, t_approx, p_tmp, v_tmp, a_tmp, s_tmp);
-                res.velocities[d][k]    = v_tmp;
-                res.accelerations[d][k] = a_tmp;
+        for (size_t k = 1; k < n_steps; ++k) {
+            const double time_remaining = (n_steps - k) * sim_dt;
+            for (size_t d = 0; d < degrees_of_freedom; ++d) {
+                size_t sec_prev = section_cur[d];
+                bool was_fin = finished[d] != 0;
+                if (finished[d]) {
+                    res.positions[d][k]     = p_cur[d];
+                    res.velocities[d][k]    = v_cur[d];
+                    res.accelerations[d][k] = a_cur[d];
+                } else {
+                    const double s_target = u_to_s_for_dof(d, u_ref[k]);
+                    bool f = finished[d] != 0;
+                    Profile step_prof;
+                    bool prof_valid = false;
+                    advance_one_dof(d, p_cur[d], v_cur[d], a_cur[d], step_prof, prof_valid,
+                                    section_cur[d], f,
+                                    sim_dt, s_target,
+                                    input.target_velocity[d],
+                                    input.target_acceleration[d],
+                                    time_remaining);
+                    finished[d] = f ? 1 : 0;
+                    res.positions[d][k]     = p_cur[d];
+                    res.velocities[d][k]    = v_cur[d];
+                    res.accelerations[d][k] = a_cur[d];
+                    if (prof_valid) res.profiles[d][k] = step_prof;
+                }
+                if (d == 0 && (k % 200 == 0 || section_cur[d] != sec_prev || finished[d] != was_fin
+                               || (k >= 1675 && k <= 1700))) {
+                    std::fprintf(stderr, "[dbg k=%zu d=%zu] p=%.6f v=%.6f a=%.5f sec=%zu T_u=%.5f T_l=%.5f T_i=%.5f m=%.3f af_interp=%.3f s_tgt=%.4f\n",
+                                 k, d, p_cur[d], v_cur[d], a_cur[d], section_cur[d],
+                                 g_trc_last_T_u, g_trc_last_T_l, g_trc_last_T_i,
+                                 g_trc_last_m, g_trc_last_af_interp,
+                                 u_to_s_for_dof(d, u_ref[k]));
+                }
             }
         }
 
-        // Compute deviations from the reference path
         double sum_dev = 0.0, max_dev = 0.0;
         for (size_t k = 0; k < n_steps; ++k) {
             double sq = 0.0;
@@ -682,69 +966,127 @@ class LocalWaypointsCalculator {
         traj.resize(n_micro - 1);
         traj.continue_calculation_counter = 0;
 
-        // Propagate state through micro-segments so that consecutive profiles
-        // are continuous in position, velocity, and acceleration.  Each segment
-        // starts from the ACTUAL end state of the previous segment (not from
-        // the tracking's interpolated state which may be inconsistent).
-        std::vector<double> p_cur(degrees_of_freedom), v_cur(degrees_of_freedom), a_cur(degrees_of_freedom);
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            p_cur[d] = tracking.positions[d][0];
-            v_cur[d] = tracking.velocities[d][0];
-            a_cur[d] = tracking.accelerations[d][0];
-        }
-
+        // Each sim step is represented by the first sim_dt slice of the Ruckig
+        // intermediate profile that generated the tracked transition. Copying
+        // the profile and truncating to sim_dt preserves any phase transitions
+        // that fall inside the sim step (e.g. jerk switching from ±j_max to 0
+        // when acceleration saturates mid-step). Storing only the first-phase
+        // jerk would mis-represent these steps and violate kinematic limits.
+        const double dt = sim_dt;
         double cumulative = 0.0;
         for (size_t s = 0; s < n_micro; ++s) {
             for (size_t d = 0; d < degrees_of_freedom; ++d) {
-                double p0 = p_cur[d];
-                double v0 = v_cur[d];
-                double a0 = a_cur[d];
-                double p1 = tracking.positions[d][s+1];
-                double v1 = tracking.velocities[d][s+1];
-                double a1 = tracking.accelerations[d][s+1];
-
-                if (solve_1dof(p0, v0, a0, p1, v1, a1, dof_limits[d], sim_dt)) {
-                    traj.profiles[s][d] = bs_traj.profiles[0][0];
+                Profile& prof = traj.profiles[s][d];
+                const Profile& src = tracking.profiles[d][s + 1];
+                // If tracking produced a valid profile for this step, truncate
+                // it to sim_dt. Otherwise (finished/disabled DoF), emit a rest.
+                const bool has_profile =
+                    src.t[0] > 0.0 || src.t[1] > 0.0 || src.t[2] > 0.0 ||
+                    src.t[3] > 0.0 || src.t[4] > 0.0 || src.t[5] > 0.0 ||
+                    src.t[6] > 0.0;
+                if (has_profile) {
+                    prof = src;
+                    truncate_profile(prof, dt);
                 } else {
-                    // Fallback: single-phase cubic profile that exactly hits p1.
-                    // Jerk is chosen so that p[1] = p1 (position continuity guaranteed).
-                    // Velocity/acceleration at the end are whatever the cubic gives.
-                    Profile& prof = traj.profiles[s][d];
                     prof.t.fill(0.0);
-                    prof.t[0] = sim_dt;
-                    prof.t_sum[0] = sim_dt;
-                    for (size_t i = 1; i < 7; ++i) prof.t_sum[i] = sim_dt;
-                    const double dt = sim_dt;
-                    // j such that p0 + v0*dt + a0*dt^2/2 + j*dt^3/6 = p1
-                    const double j_needed = 6.0 * (p1 - p0 - v0*dt - 0.5*a0*dt*dt) / (dt*dt*dt);
                     prof.j.fill(0.0);
-                    prof.j[0] = j_needed;
-                    prof.p[0] = p0; prof.v[0] = v0; prof.a[0] = a0;
+                    prof.t[6] = dt;
+                    prof.p[0] = tracking.positions[d][s];
+                    prof.v[0] = tracking.velocities[d][s];
+                    prof.a[0] = tracking.accelerations[d][s];
                     for (size_t i = 0; i < 7; ++i) {
                         prof.a[i+1] = prof.a[i] + prof.t[i] * prof.j[i];
-                        prof.v[i+1] = prof.v[i] + prof.t[i] * (prof.a[i] + prof.t[i] * prof.j[i] / 2);
-                        prof.p[i+1] = prof.p[i] + prof.t[i] * (prof.v[i] + prof.t[i] * (prof.a[i] / 2 + prof.t[i] * prof.j[i] / 6));
+                        prof.v[i+1] = prof.v[i] + prof.t[i] * (prof.a[i] + prof.t[i] * prof.j[i] / 2.0);
+                        prof.p[i+1] = prof.p[i] + prof.t[i] * (prof.v[i] + prof.t[i] * (prof.a[i] / 2.0 + prof.t[i] * prof.j[i] / 6.0));
                     }
-                    prof.pf = prof.p[1]; prof.vf = prof.v[1]; prof.af = prof.a[1];
+                    prof.t_sum[0] = prof.t[0];
+                    for (size_t i = 1; i < 7; ++i) prof.t_sum[i] = prof.t_sum[i-1] + prof.t[i];
+                    prof.pf = prof.p[7];
+                    prof.vf = prof.v[7];
+                    prof.af = prof.a[7];
                     prof.brake.duration = 0.0;
                     prof.brake.t[0] = 0.0; prof.brake.t[1] = 0.0;
                     prof.accel.duration = 0.0;
                     prof.accel.t[0] = 0.0; prof.accel.t[1] = 0.0;
                 }
-
-                // Propagate: next segment starts from this segment's actual end state
-                const Profile& prof = traj.profiles[s][d];
-                p_cur[d] = prof.pf;
-                v_cur[d] = prof.vf;
-                a_cur[d] = prof.af;
             }
-            cumulative += sim_dt;
+            cumulative += dt;
             traj.cumulative_times[s] = cumulative;
         }
 
         traj.duration = cumulative;
         for (size_t d = 0; d < degrees_of_freedom; ++d)
             traj.independent_min_durations[d] = cumulative;
+
+        // Diagnostic: brake/accel usage in source profiles before truncate.
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            size_t n_brake = 0;
+            double max_brake_dur = 0.0;
+            size_t worst_s = 0;
+            for (size_t s = 0; s < n_micro; ++s) {
+                const Profile& src = tracking.profiles[d][s + 1];
+                if (src.brake.duration > 0.0) {
+                    n_brake++;
+                    if (src.brake.duration > max_brake_dur) {
+                        max_brake_dur = src.brake.duration;
+                        worst_s = s;
+                    }
+                }
+            }
+            if (n_brake > 0) {
+                const Profile& src = tracking.profiles[d][worst_s + 1];
+                std::fprintf(stderr, "[recon] dof=%zu: %zu profiles with brake (max=%.4f at s=%zu) brake_p0=%.5f v0=%.5f a0=%.5f main_p0=%.5f v0=%.5f a0=%.5f pf=%.5f\n",
+                             d, n_brake, max_brake_dur, worst_s,
+                             src.brake.p[0], src.brake.v[0], src.brake.a[0],
+                             src.p[0], src.v[0], src.a[0], src.pf);
+                // Show first 3 brakes for this DoF.
+                size_t shown = 0;
+                for (size_t s = 0; s < n_micro && shown < 3; ++s) {
+                    const Profile& p = tracking.profiles[d][s + 1];
+                    if (p.brake.duration > 0.0) {
+                        std::fprintf(stderr, "  brake[%zu] s=%zu dur=%.6f pf=%.5f vf=%.5f af=%.5f (tracking.pos[d][s]=%.5f, [d][s+1]=%.5f)\n",
+                                     shown, s, p.brake.duration, p.pf, p.vf, p.af,
+                                     tracking.positions[d][s], tracking.positions[d][s + 1]);
+                        shown++;
+                    }
+                }
+            }
+        }
+
+        // Diagnostic: check continuity across micro-segments.
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            double max_dp = 0.0, max_dv = 0.0, max_da = 0.0;
+            size_t worst_dp = 0, worst_dv = 0, worst_da = 0;
+            double max_jerk_any = 0.0;
+            size_t worst_jerk_s = 0, worst_jerk_phase = 0;
+            for (size_t s = 0; s + 1 < n_micro; ++s) {
+                double pf = traj.profiles[s][d].pf;
+                double p0 = traj.profiles[s+1][d].p[0];
+                double vf = traj.profiles[s][d].vf;
+                double v0 = traj.profiles[s+1][d].v[0];
+                double af = traj.profiles[s][d].af;
+                double a0 = traj.profiles[s+1][d].a[0];
+                double dp = std::abs(pf - p0);
+                double dv = std::abs(vf - v0);
+                double da = std::abs(af - a0);
+                if (dp > max_dp) { max_dp = dp; worst_dp = s; }
+                if (dv > max_dv) { max_dv = dv; worst_dv = s; }
+                if (da > max_da) { max_da = da; worst_da = s; }
+            }
+            for (size_t s = 0; s < n_micro; ++s) {
+                const Profile& pr = traj.profiles[s][d];
+                for (size_t ph = 0; ph < 7; ++ph) {
+                    if (std::abs(pr.j[ph]) > max_jerk_any) {
+                        max_jerk_any = std::abs(pr.j[ph]);
+                        worst_jerk_s = s;
+                        worst_jerk_phase = ph;
+                    }
+                }
+            }
+            std::fprintf(stderr, "[recon] dof=%zu: max_dp=%.3e (s=%zu) max_dv=%.3e (s=%zu) max_da=%.3e (s=%zu) max|j|=%.3f (s=%zu ph=%zu)\n",
+                         d, max_dp, worst_dp, max_dv, worst_dv, max_da, worst_da,
+                         max_jerk_any, worst_jerk_s, worst_jerk_phase);
+        }
         return Result::Working;
     }
 
@@ -756,6 +1098,7 @@ public:
         bs_calc(TargetCalculator<0, StandardVector>(1)),
         bs_input(InputParameter<0, StandardVector>(1)),
         bs_traj(Trajectory<0, StandardVector>(1)),
+        bs_traj_upper(Trajectory<0, StandardVector>(1)),
         degrees_of_freedom(DOFs)
     { initialize_binary_search_input(); }
 
@@ -771,6 +1114,7 @@ public:
         bs_calc(TargetCalculator<0, StandardVector>(1)),
         bs_input(InputParameter<0, StandardVector>(1)),
         bs_traj(Trajectory<0, StandardVector>(1)),
+        bs_traj_upper(Trajectory<0, StandardVector>(1)),
         degrees_of_freedom(dofs)
     { initialize_binary_search_input(); }
 
@@ -857,32 +1201,17 @@ public:
             u_ref[k] = std::max(u_ref[k], u_ref[k-1]);
         u_ref.back() = total_u;
 
-        // Iterative tracking (Section III-D)
-        TrackingResult best;
-        if (degrees_of_freedom == 1) {
-            // For 1-DoF, just sample the fast trajectory directly
-            best.n_steps = n_steps;
-            best.total_time = slowest_t;
-            best.positions.resize(1, std::vector<double>(n_steps));
-            best.velocities.resize(1, std::vector<double>(n_steps));
-            best.accelerations.resize(1, std::vector<double>(n_steps));
-            for (size_t k = 0; k < n_steps; ++k) {
-                double t = k * sim_dt;
-                double s;
-                sample_section_seq(fast_trajs[0], t,
-                                    best.positions[0][k],
-                                    best.velocities[0][k],
-                                    best.accelerations[0][k], s);
-            }
-        } else {
-            // Paper §III-D iterative tracking: update u_ref based on the LATEST
-            // tracking result (which matches the current u_ref) rather than the
-            // best-so-far (which may have been from a different u_ref).
-            // Select the iteration with lowest avg_deviation for the final result.
-            TrackingResult latest = track(input, u_ref, fast_trajs);
-            best = latest;
-            std::vector<double> best_u_ref = u_ref;
-            for (int iter = 1; iter < n_tracking_iterations; ++iter) {
+        // Paper §III-D iterative tracking. For 1-DoF the first tracking
+        // result has zero deviation (u_ref == s), so no iteration is needed;
+        // for multi-DoF we iterate and keep the iteration with the lowest
+        // average deviation.
+        std::fprintf(stderr, "[calc] tracking start n_steps=%zu\n", n_steps);
+        TrackingResult latest = track(input, u_ref, fast_trajs);
+        std::fprintf(stderr, "[calc] tracking done\n");
+        TrackingResult best = latest;
+        std::vector<double> best_u_ref = u_ref;
+        if (degrees_of_freedom > 1) {
+            for (int iter = 1; iter < 1 /* n_tracking_iterations */; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
                 if (latest.avg_deviation < best.avg_deviation) {
