@@ -51,7 +51,7 @@ class LocalWaypointsCalculator {
     static constexpr int binary_search_iterations {16};
     static constexpr double overshoot_tolerance {1e-9};
     static constexpr double position_eps {1e-12};
-    static constexpr int n_tracking_iterations {20};
+    static constexpr int n_tracking_iterations {50};
     static constexpr double delta_u_ref {0.01};
 
     double sim_dt {0.0025};
@@ -272,14 +272,17 @@ class LocalWaypointsCalculator {
             dp.extrema_wp.push_back(0);
             dp.extrema_pos.push_back(wp_pos(d, 0));
 
+            // Include every multi-dim waypoint as a per-DoF section boundary,
+            // not only true local extrema. On monotonic pass-throughs the
+            // v=0 requirement at the boundary slows this DoF down a little,
+            // but it prevents the DoF from flying past intermediate waypoints
+            // that it would otherwise "skip" (no sign flip ⇒ skipped by the
+            // strict-extrema rule). This keeps the tracked path aligned with
+            // the reference polyline at every waypoint, at the cost of a
+            // small duration increase.
             for (size_t i = 1; i < n_waypoints_ - 1; ++i) {
-                double dir_in = wp_pos(d, i) - wp_pos(d, i-1);
-                double dir_out = wp_pos(d, i+1) - wp_pos(d, i);
-                if (std::abs(dir_in) < position_eps || std::abs(dir_out) < position_eps
-                    || dir_in * dir_out < 0.0) {
-                    dp.extrema_wp.push_back(i);
-                    dp.extrema_pos.push_back(wp_pos(d, i));
-                }
+                dp.extrema_wp.push_back(i);
+                dp.extrema_pos.push_back(wp_pos(d, i));
             }
 
             dp.extrema_wp.push_back(n_waypoints_ - 1);
@@ -1018,8 +1021,6 @@ class LocalWaypointsCalculator {
         const bool completed = upper.duration <= dt + 1e-12 && m >= 1.0 - 1e-9;
         const bool reached_pend = sign * (p - p_end) >= -overshoot_tolerance;
         if (completed || reached_pend) {
-            // Snap state to prevent numerical overshoot from bleeding into
-            // the next section.
             p = p_end;
             v = 0.0;
             ++section;
