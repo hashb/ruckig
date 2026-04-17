@@ -371,6 +371,92 @@ def plot_path_geometry(filename, ref_poly, runs, resampled, dev_from_ref):
     print(f"saved {out_path}")
 
 # ---------------------------------------------------------------------------
+# Kinematic-validity check
+# ---------------------------------------------------------------------------
+
+def check_kinematic_limits(inp, runs, dt=1e-4, tol_factor=1.05):
+    """Sample each trajectory at fine resolution and verify that velocity,
+    acceleration, and jerk stay within the specified limits (with a small
+    tolerance factor to allow for numerical noise).
+
+    Jerk is estimated via finite differences of the acceleration signal.
+
+    Prints a per-backend, per-DoF report and returns True only if every
+    backend passes.
+    """
+    dofs = inp.degrees_of_freedom
+    v_max = np.array(inp.max_velocity)
+    a_max = np.array(inp.max_acceleration)
+    j_max = np.array(inp.max_jerk)
+
+    all_ok = True
+
+    print("\n--- Kinematic-limits validation ---")
+    print(f"Tolerance factor: {tol_factor}  (limits multiplied by this value)")
+    print(f"Sample dt: {dt}\n")
+
+    for run_key, (label, out_list) in runs.items():
+        traj = out_list[0].trajectory
+        duration = traj.duration
+        n = int(np.ceil(duration / dt)) + 1
+        times = np.linspace(0.0, duration, n)
+
+        pos = np.empty((n, dofs))
+        vel = np.empty((n, dofs))
+        acc = np.empty((n, dofs))
+        for i, t in enumerate(times):
+            p, v, a = traj.at_time(t)
+            pos[i] = p
+            vel[i] = v
+            acc[i] = a
+
+        # Jerk via finite differences of acceleration
+        jerk = np.diff(acc, axis=0) / dt
+
+        # Per-DoF checks
+        backend_ok = True
+        header = (f"  {'DoF':>3s}  {'|v|_max':>9s} / {'v_lim':>7s}  "
+                  f"{'|a|_max':>9s} / {'a_lim':>7s}  "
+                  f"{'|j|_max':>9s} / {'j_lim':>7s}  {'status'}")
+        print(f"{label}:")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for d in range(dofs):
+            v_peak = np.max(np.abs(vel[:, d]))
+            a_peak = np.max(np.abs(acc[:, d]))
+            j_peak = np.max(np.abs(jerk[:, d]))
+
+            v_ok = v_peak <= v_max[d] * tol_factor
+            a_ok = a_peak <= a_max[d] * tol_factor
+            j_ok = j_peak <= j_max[d] * tol_factor
+            dof_ok = v_ok and a_ok and j_ok
+
+            flags = []
+            if not v_ok:
+                flags.append("v!")
+            if not a_ok:
+                flags.append("a!")
+            if not j_ok:
+                flags.append("j!")
+            status = "OK" if dof_ok else "FAIL " + " ".join(flags)
+
+            print(f"  {d+1:3d}  {v_peak:9.4f} / {v_max[d]:7.3f}  "
+                  f"{a_peak:9.4f} / {a_max[d]:7.3f}  "
+                  f"{j_peak:9.4f} / {j_max[d]:7.3f}  {status}")
+
+            if not dof_ok:
+                backend_ok = False
+
+        result = "PASS" if backend_ok else "FAIL"
+        print(f"  => {label}: {result}\n")
+        if not backend_ok:
+            all_ok = False
+
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -396,6 +482,9 @@ if __name__ == "__main__":
 
     inp_ref = make_input()
     ref_poly = build_reference_polyline(inp_ref)
+
+    # ---- kinematic-validity check ----
+    check_kinematic_limits(inp_ref, runs)
 
     # ---- deviation analysis ----
     dev_from_ref, resampled = compare_paths(runs, ref_poly)
