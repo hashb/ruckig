@@ -53,7 +53,7 @@ class LocalWaypointsCalculator {
     static constexpr double overshoot_tolerance {1e-9};
     static constexpr double position_eps {1e-12};
     static constexpr int n_tracking_iterations {20};
-    static constexpr double delta_u_ref_fraction {0.10};
+    static constexpr double delta_u_ref {0.01};
 
     double sim_dt {0.0025};
 
@@ -478,6 +478,44 @@ class LocalWaypointsCalculator {
         return wp_pos(d, sec) + f * (wp_pos(d, sec+1) - wp_pos(d, sec));
     }
 
+    //! Convert a tracked state on a monotonic 1-D section back to cumulative
+    //! path length s. Unlike position_to_s(), this uses the active section
+    //! chosen by the online tracker, so repeated positions across sections do
+    //! not alias to the wrong branch during iterative u_ref updates.
+    double tracked_state_to_s(size_t d, size_t section, double p) const {
+        const auto& dp = dof_paths[d];
+        if (dp.total_s < position_eps) return 0.0;
+        if (section >= dp.seg_lengths.size()) return dp.total_s;
+
+        const double p_start = dp.extrema_pos[section];
+        const double p_end = dp.extrema_pos[section + 1];
+        double local_s = (p_end >= p_start) ? (p - p_start) : (p_start - p);
+        local_s = std::min(std::max(local_s, 0.0), dp.seg_lengths[section]);
+        return std::min(std::max(dp.cum_s[section] + local_s, 0.0), dp.total_s);
+    }
+
+    //! Map a dt-sampled position back to cumulative s using the known forward
+    //! path order from the current section. This avoids ambiguous global
+    //! closest-section projection when a probe trajectory reaches the next
+    //! section before dt elapses.
+    double forward_position_to_s(size_t d, size_t section_hint, double p) const {
+        const auto& dp = dof_paths[d];
+        if (dp.total_s < position_eps) return 0.0;
+
+        const size_t last_section = dp.seg_lengths.empty() ? 0 : (dp.seg_lengths.size() - 1);
+        for (size_t section = std::min(section_hint, last_section); section < dp.seg_lengths.size(); ++section) {
+            const double p_start = dp.extrema_pos[section];
+            const double p_end = dp.extrema_pos[section + 1];
+            const double lo = std::min(p_start, p_end) - overshoot_tolerance;
+            const double hi = std::max(p_start, p_end) + overshoot_tolerance;
+            if (p >= lo && p <= hi) {
+                return tracked_state_to_s(d, section, p);
+            }
+        }
+
+        return dp.total_s;
+    }
+
     //! Map per-DoF cumulative path length s to position on the 1-D path.
     //! Within each section (between extrema) the path is monotonic, so
     //! position = p_start ± local_s depending on direction.
@@ -561,6 +599,8 @@ class LocalWaypointsCalculator {
         std::vector<std::vector<double>> positions;   // [dof][step]
         std::vector<std::vector<double>> velocities;
         std::vector<std::vector<double>> accelerations;
+        std::vector<std::vector<double>> path_lengths;
+        std::vector<std::vector<double>> u_values;
         //! Full Ruckig profile (intermediate solve) that governs the transition
         //! from step k−1 to step k, per DoF. Index [d][k] stores the profile
         //! consumed during sim step k (so [d][0] is unused). Reconstruction
@@ -572,7 +612,39 @@ class LocalWaypointsCalculator {
         double total_time {0.0};
         double max_deviation {0.0};
         double avg_deviation {0.0};
+        double max_path_deviation {0.0};
+        double avg_path_deviation {0.0};
     };
+
+    double point_to_segment_distance(const std::vector<double>& point, size_t segment) const {
+        double len_sq = 0.0;
+        double dot_pa_ab = 0.0;
+        std::vector<double> ab(degrees_of_freedom, 0.0);
+        std::vector<double> pa(degrees_of_freedom, 0.0);
+
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            const double a_d = wp_pos(d, segment);
+            const double b_d = wp_pos(d, segment + 1);
+            ab[d] = b_d - a_d;
+            pa[d] = point[d] - a_d;
+            len_sq += ab[d] * ab[d];
+            dot_pa_ab += pa[d] * ab[d];
+        }
+
+        double t = 0.0;
+        if (len_sq > position_eps) {
+            t = std::min(std::max(dot_pa_ab / len_sq, 0.0), 1.0);
+        }
+
+        double sq = 0.0;
+        for (size_t d = 0; d < degrees_of_freedom; ++d) {
+            const double closest_d = wp_pos(d, segment) + t * ab[d];
+            const double diff = point[d] - closest_d;
+            sq += diff * diff;
+        }
+
+        return std::sqrt(sq);
+    }
 
     //! Build a Ruckig-style Profile that represents exactly the first `dur`
     //! seconds of `src`, treating src's pre-trajectory brake and its main
@@ -692,10 +764,14 @@ class LocalWaypointsCalculator {
                          size_t& section,
                          bool& finished,
                          double dt_goal,
-                         double s_target,
+                         double s_lower_bound,
+                         double s_upper_bound,
+                         bool prefer_upper,
+                         bool& flip_preference,
                          double target_v, double target_a,
                          double time_remaining_in_sim) {
         out_profile_valid = false;
+        flip_preference = false;
         if (finished) return;
 
         const auto& dp = dof_paths[d];
@@ -747,13 +823,10 @@ class LocalWaypointsCalculator {
         }
         if (!upper_ok) return;
         const double T_u = bs_traj.get_duration();
-        const double step = std::min(dt_goal, T_u);
-        double p_u, v_u, a_u;
-        sample_traj(bs_traj, step, p_u, v_u, a_u);
         double p_u_step, v_u_step, a_u_step;
         sample_traj(bs_traj, dt_goal, p_u_step, v_u_step, a_u_step);
         const Profile upper_profile = bs_traj.profiles[0][0];
-        const double s_u = dp.cum_s[section] + sign * (p_u - p_start);
+        const double s_u = forward_position_to_s(d, section, p_u_step);
 
         // Lower probe: start with a braking trajectory. If it overshoots, find
         // the smallest feasible target acceleration a_min as in §III-C.
@@ -769,84 +842,44 @@ class LocalWaypointsCalculator {
         }
         if (!lower_ok) return;
         const double T_l = bs_traj.get_duration();
-        double p_l, v_l, a_l;
-        sample_traj(bs_traj, std::min(dt_goal, T_l), p_l, v_l, a_l);
         double p_l_step, v_l_step, a_l_step;
         sample_traj(bs_traj, dt_goal, p_l_step, v_l_step, a_l_step);
         const Profile lower_profile = bs_traj.profiles[0][0];
-        const double s_l = dp.cum_s[section] + sign * (p_l - p_start);
+        const double s_l = forward_position_to_s(d, section, p_l_step);
 
-        // Mapping factor m from s_target.
-        double m;
-        const double ds = s_u - s_l;
-        if (ds < 1e-15 || s_target >= s_u) {
-            m = 1.0;
-        } else if (s_target <= s_l) {
-            m = 0.0;
-        } else {
-            m = (s_target - s_l) / ds;
-            m = std::min(std::max(m, 0.0), 1.0);
-        }
+        const bool lower_in_band = s_l >= s_lower_bound - position_eps && s_l <= s_upper_bound + position_eps;
+        const bool upper_in_band = s_u >= s_lower_bound - position_eps && s_u <= s_upper_bound + position_eps;
 
-        // Intermediate trajectory: search for the target acceleration that
-        // yields a next-step progress closest to the desired s_target. Eq. 5
-        // interpolates desired progress between the lower and upper
-        // trajectories; it does not imply that progress varies linearly with
-        // the target acceleration.
         Profile best_profile = lower_profile;
         double best_p = p_l_step, best_v = v_l_step, best_a = a_l_step;
         double best_T = T_l;
-        double best_err = std::abs(s_l - s_target);
-        {
-            const double err_u = std::abs(s_u - s_target);
-            if (err_u < best_err) {
-                best_profile = upper_profile;
-                best_p = p_u_step;
-                best_v = v_u_step;
-                best_a = a_u_step;
-                best_T = T_u;
-                best_err = err_u;
-            }
-        }
+        bool choose_upper = false;
 
-        bool ok = false;
-        if (std::abs(af_upper - af_lower) < position_eps || ds < 1e-15) {
-            ok = solve_1dof(p_in, v_in, a_in, p_end, 0.0, af_lower, lim);
+        if (s_u < s_lower_bound - position_eps) {
+            choose_upper = true;
+        } else if (s_l > s_upper_bound + position_eps) {
+            choose_upper = false;
+        } else if (lower_in_band && upper_in_band) {
+            choose_upper = prefer_upper;
+            flip_preference = true;
+        } else if (!lower_in_band && upper_in_band) {
+            choose_upper = true;
+        } else if (lower_in_band && !upper_in_band) {
+            choose_upper = false;
         } else {
-            double lo_mag = std::abs(af_lower);
-            double hi_mag = std::abs(af_upper);
-            for (int i = 0; i < binary_search_iterations; ++i) {
-                const double mid_mag = 0.5 * (lo_mag + hi_mag);
-                if (!solve_1dof(p_in, v_in, a_in, p_end, 0.0, sign * mid_mag, lim)) {
-                    hi_mag = mid_mag;
-                    continue;
-                }
-
-                const double T_mid = bs_traj.get_duration();
-                double p_mid, v_mid, a_mid;
-                sample_traj(bs_traj, std::min(dt_goal, T_mid), p_mid, v_mid, a_mid);
-                double p_mid_step, v_mid_step, a_mid_step;
-                sample_traj(bs_traj, dt_goal, p_mid_step, v_mid_step, a_mid_step);
-                const double s_mid = dp.cum_s[section] + sign * (p_mid - p_start);
-                const double err_mid = std::abs(s_mid - s_target);
-                if (err_mid < best_err) {
-                    best_profile = bs_traj.profiles[0][0];
-                    best_p = p_mid_step;
-                    best_v = v_mid_step;
-                    best_a = a_mid_step;
-                    best_T = T_mid;
-                    best_err = err_mid;
-                }
-
-                if (s_mid < s_target) {
-                    lo_mag = mid_mag;
-                } else {
-                    hi_mag = mid_mag;
-                }
-            }
-
-            ok = true;
+            const double s_mid = 0.5 * (s_lower_bound + s_upper_bound);
+            choose_upper = std::abs(s_u - s_mid) <= std::abs(s_l - s_mid);
         }
+
+        if (choose_upper) {
+            best_profile = upper_profile;
+            best_p = p_u_step;
+            best_v = v_u_step;
+            best_a = a_u_step;
+            best_T = T_u;
+        }
+
+        bool ok = true;
         if (!ok) return;
 
         const double T_i = best_T;
@@ -893,16 +926,21 @@ class LocalWaypointsCalculator {
         res.positions.resize(degrees_of_freedom);
         res.velocities.resize(degrees_of_freedom);
         res.accelerations.resize(degrees_of_freedom);
+        res.path_lengths.resize(degrees_of_freedom);
+        res.u_values.resize(degrees_of_freedom);
         res.profiles.resize(degrees_of_freedom);
 
         std::vector<double> p_cur(degrees_of_freedom), v_cur(degrees_of_freedom), a_cur(degrees_of_freedom);
         std::vector<size_t> section_cur(degrees_of_freedom, 0);
         std::vector<char> finished(degrees_of_freedom, 0);
+        std::vector<bool> prefer_upper(degrees_of_freedom, true);
 
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             res.positions[d].resize(n_steps);
             res.velocities[d].resize(n_steps);
             res.accelerations[d].resize(n_steps);
+            res.path_lengths[d].resize(n_steps);
+            res.u_values[d].resize(n_steps);
             res.profiles[d].resize(n_steps);
 
             p_cur[d] = input.current_position[d];
@@ -911,6 +949,8 @@ class LocalWaypointsCalculator {
             res.positions[d][0]     = p_cur[d];
             res.velocities[d][0]    = v_cur[d];
             res.accelerations[d][0] = a_cur[d];
+            res.path_lengths[d][0]  = 0.0;
+            res.u_values[d][0]      = 0.0;
             finished[d] = (!input.enabled[d] || dof_paths[d].total_s < position_eps) ? 1 : 0;
         }
 
@@ -922,22 +962,36 @@ class LocalWaypointsCalculator {
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
                 } else {
-                    const double u_band_upper = std::min(total_u, u_ref[k] + delta_u_ref_fraction * total_u);
-                    const double s_target = u_to_s_for_dof(d, u_band_upper);
+                    const double u_band_lower = std::max(0.0, u_ref[k] - delta_u_ref);
+                    const double u_band_upper = std::min(total_u, u_ref[k] + delta_u_ref);
+                    const double s_lower_bound = u_to_s_for_dof(d, u_band_lower);
+                    const double s_upper_bound = u_to_s_for_dof(d, u_band_upper);
                     bool f = finished[d] != 0;
                     Profile step_prof;
                     bool prof_valid = false;
+                    bool flip_preference = false;
                     advance_one_dof(d, p_cur[d], v_cur[d], a_cur[d], step_prof, prof_valid,
                                     section_cur[d], f,
-                                    sim_dt, s_target,
+                                    sim_dt, s_lower_bound, s_upper_bound,
+                                    prefer_upper[d], flip_preference,
                                     input.target_velocity[d],
                                     input.target_acceleration[d],
                                     time_remaining);
                     finished[d] = f ? 1 : 0;
+                    if (flip_preference) prefer_upper[d] = !prefer_upper[d];
                     res.positions[d][k]     = p_cur[d];
                     res.velocities[d][k]    = v_cur[d];
                     res.accelerations[d][k] = a_cur[d];
                     if (prof_valid) res.profiles[d][k] = step_prof;
+                }
+
+                if (input.enabled[d] && dof_paths[d].total_s >= position_eps) {
+                    const double s_cur = tracked_state_to_s(d, section_cur[d], p_cur[d]);
+                    res.path_lengths[d][k] = s_cur;
+                    res.u_values[d][k] = state_to_u(d, p_cur[d], s_cur);
+                } else {
+                    res.path_lengths[d][k] = 0.0;
+                    res.u_values[d][k] = 0.0;
                 }
             }
         }
@@ -955,22 +1009,41 @@ class LocalWaypointsCalculator {
         }
         res.max_deviation = max_dev;
         res.avg_deviation = n_steps > 0 ? sum_dev / n_steps : 0.0;
+
+        double sum_path_dev = 0.0;
+        double max_path_dev = 0.0;
+        std::vector<double> point(degrees_of_freedom, 0.0);
+        for (size_t k = 0; k < n_steps; ++k) {
+            for (size_t d = 0; d < degrees_of_freedom; ++d) {
+                point[d] = res.positions[d][k];
+            }
+
+            double best_dist = std::numeric_limits<double>::infinity();
+            for (size_t seg = 0; seg + 1 < n_waypoints_; ++seg) {
+                best_dist = std::min(best_dist, point_to_segment_distance(point, seg));
+            }
+
+            sum_path_dev += best_dist;
+            max_path_dev = std::max(max_path_dev, best_dist);
+        }
+        res.max_path_deviation = max_path_dev;
+        res.avg_path_deviation = n_steps > 0 ? sum_path_dev / n_steps : 0.0;
         return res;
     }
 
     void update_u_ref(std::vector<double>& u_ref, const TrackingResult& res) {
         if (res.n_steps < 2) return;
 
-        const double delta = delta_u_ref_fraction * total_u;
+        const double delta = std::min(delta_u_ref, total_u);
 
-        std::vector<std::vector<double>> u_actual(degrees_of_freedom, std::vector<double>(res.n_steps, 0.0));
-        std::vector<std::vector<double>> pos_dev(degrees_of_freedom, std::vector<double>(res.n_steps, 0.0));
+        std::vector<double> pos_dev(res.n_steps, 0.0);
         for (size_t k = 0; k < res.n_steps; ++k) {
+            double sq = 0.0;
             for (size_t d = 0; d < degrees_of_freedom; ++d) {
-                const double s_d = position_to_s(d, res.positions[d][k]);
-                u_actual[d][k] = state_to_u(d, res.positions[d][k], s_d);
-                pos_dev[d][k] = std::abs(res.positions[d][k] - u_to_position(d, u_ref[k]));
+                const double diff = res.positions[d][k] - u_to_position(d, u_ref[k]);
+                sq += diff * diff;
             }
+            pos_dev[k] = std::sqrt(sq);
         }
 
         // Paper §III-D updates the single path dimension and contiguous time
@@ -985,14 +1058,14 @@ class LocalWaypointsCalculator {
             size_t seg_start = 0;
             for (size_t k = 0; k <= res.n_steps; ++k) {
                 const double lower_bound = (k < res.n_steps) ? std::max(0.0, u_ref[k] - delta) : 0.0;
-                const bool active = (k < res.n_steps && u_actual[d][k] < lower_bound - position_eps);
+                const bool active = (k < res.n_steps && res.u_values[d][k] < lower_bound - position_eps);
                 if (active && !in_seg) {
                     seg_start = k;
                     in_seg = true;
                 } else if (!active && in_seg) {
                     double area = 0.0;
                     for (size_t j = seg_start; j < k; ++j) {
-                        area += pos_dev[d][j];
+                        area += pos_dev[j];
                     }
                     if (area > best_area) {
                         best_area = area;
@@ -1009,11 +1082,11 @@ class LocalWaypointsCalculator {
         // Lower u_ref in the selected region so that the offending dimension
         // lies within the desired lower u_ref band in the next iteration.
         for (size_t k = best_lo; k <= best_hi; ++k) {
-            u_ref[k] = std::min(u_ref[k], std::min(u_actual[best_d][k] + delta, total_u));
+            u_ref[k] = std::min(u_ref[k], std::min(res.u_values[best_d][k] + delta, total_u));
         }
 
         // Keep u_ref monotonic after the local update.
-        for (size_t k = 1; k < res.n_steps; ++k) {
+        for (size_t k = best_lo + 1; k < res.n_steps; ++k) {
             u_ref[k] = std::max(u_ref[k], u_ref[k - 1]);
             u_ref[k] = std::min(u_ref[k], total_u);
         }
@@ -1335,7 +1408,7 @@ class LocalWaypointsCalculator {
             for (int iter = 1; iter < n_tracking_iterations; ++iter) {
                 update_u_ref(u_ref, latest);
                 latest = track(input, u_ref, fast_trajs);
-                if (latest.avg_deviation < best.avg_deviation) {
+                if (latest.avg_path_deviation < best.avg_path_deviation) {
                     best = latest;
                     best_u_ref = u_ref;
                 }
@@ -1424,6 +1497,15 @@ public:
                 pre_input, pre_traj, delta_time, pre_interrupted
             );
             if (pre_res < 0) return pre_res;
+
+            if (pre_traj.get_duration() > position_eps) {
+                pre_traj.at_time(
+                    pre_traj.get_duration(),
+                    core_input.current_position,
+                    core_input.current_velocity,
+                    core_input.current_acceleration
+                );
+            }
         }
 
         const Result main_res = calculate_core<throw_error>(
@@ -1432,11 +1514,23 @@ public:
         if (main_res < 0) return main_res;
 
         if (align_target) {
+            Vector<double> post_start_position = input.target_position;
+            Vector<double> post_start_velocity = zero_velocity;
+            Vector<double> post_start_acceleration = zero_acceleration;
+            if (main_traj.get_duration() > position_eps) {
+                main_traj.at_time(
+                    main_traj.get_duration(),
+                    post_start_position,
+                    post_start_velocity,
+                    post_start_acceleration
+                );
+            }
+
             const auto post_input = make_alignment_input(
                 input,
-                input.target_position,
-                zero_velocity,
-                zero_acceleration,
+                post_start_position,
+                post_start_velocity,
+                post_start_acceleration,
                 input.target_position,
                 input.target_velocity,
                 input.target_acceleration
