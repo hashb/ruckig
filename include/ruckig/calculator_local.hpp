@@ -1620,15 +1620,25 @@ public:
         const bool align_current = needs_alignment_at_current(input);
         const bool align_target = needs_alignment_at_target(input);
 
-        if (!align_current && !align_target) {
+        // When only the current state needs alignment (non-zero initial
+        // velocity/acceleration), pass the actual initial state directly
+        // to calculate_core instead of doing a separate pre-alignment
+        // trajectory. The core algorithm naturally handles non-zero initial
+        // states — Ruckig computes trajectories from arbitrary (p,v,a) to
+        // the first per-DoF extremum, and the online tracking scheme (§III-C)
+        // naturally brings v to 0 at each extremum. A separate
+        // pre-alignment wastes time by braking to rest at the current
+        // position instead of braking toward the first waypoint.
+        if (!align_target) {
             return calculate_core<throw_error>(input, traj, delta_time, was_interrupted);
         }
 
+        // Target alignment: compute core with v=0, a=0 at the target,
+        // then append a post-alignment trajectory to reach the desired
+        // target velocity/acceleration.
         InputParameter<DOFs, CustomVector> core_input = input;
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             if (!input.enabled[d]) continue;
-            core_input.current_velocity[d] = 0.0;
-            core_input.current_acceleration[d] = 0.0;
             core_input.target_velocity[d] = 0.0;
             core_input.target_acceleration[d] = 0.0;
         }
@@ -1636,52 +1646,18 @@ public:
         const Vector<double> zero_velocity = make_zero_vector();
         const Vector<double> zero_acceleration = make_zero_vector();
 
-        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
         Trajectory<DOFs, CustomVector> main_traj = make_temp_trajectory();
         Trajectory<DOFs, CustomVector> post_traj = make_temp_trajectory();
 
-        bool pre_interrupted = false;
         bool main_interrupted = false;
         bool post_interrupted = false;
-
-        if (align_current) {
-            // Pre-alignment: brake from (current_vel, current_acc) to v=0,
-            // a=0 at (approximately) the current position. The braking
-            // overshoot is small and the core trajectory then handles the
-            // full path from start through all intermediate waypoints.
-            Vector<double> pre_target = input.current_position;
-
-            const auto pre_input = make_alignment_input(
-                input,
-                input.current_position,
-                input.current_velocity,
-                input.current_acceleration,
-                pre_target,
-                zero_velocity,
-                zero_acceleration
-            );
-
-            const Result pre_res = segment_calc.template calculate<throw_error>(
-                pre_input, pre_traj, delta_time, pre_interrupted
-            );
-            if (pre_res < 0) return pre_res;
-
-            if (pre_traj.get_duration() > position_eps) {
-                pre_traj.at_time(
-                    pre_traj.get_duration(),
-                    core_input.current_position,
-                    core_input.current_velocity,
-                    core_input.current_acceleration
-                );
-            }
-        }
 
         const Result main_res = calculate_core<throw_error>(
             core_input, main_traj, delta_time, main_interrupted
         );
         if (main_res < 0) return main_res;
 
-        if (align_target) {
+        {
             Vector<double> post_start_position = input.target_position;
             Vector<double> post_start_velocity = zero_velocity;
             Vector<double> post_start_acceleration = zero_acceleration;
@@ -1710,8 +1686,9 @@ public:
             if (post_res < 0) return post_res;
         }
 
+        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
         concatenate_trajectories(pre_traj, main_traj, post_traj, traj);
-        was_interrupted = pre_interrupted || main_interrupted || post_interrupted;
+        was_interrupted = main_interrupted || post_interrupted;
         return Result::Working;
     }
 
