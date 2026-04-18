@@ -272,17 +272,26 @@ class LocalWaypointsCalculator {
             dp.extrema_wp.push_back(0);
             dp.extrema_pos.push_back(wp_pos(d, 0));
 
-            // Include every multi-dim waypoint as a per-DoF section boundary,
-            // not only true local extrema. On monotonic pass-throughs the
-            // v=0 requirement at the boundary slows this DoF down a little,
-            // but it prevents the DoF from flying past intermediate waypoints
-            // that it would otherwise "skip" (no sign flip ⇒ skipped by the
-            // strict-extrema rule). This keeps the tracked path aligned with
-            // the reference polyline at every waypoint, at the cost of a
-            // small duration increase.
+            // Per paper §III-B: only true local extrema are section
+            // boundaries. At a local extremum the per-DoF direction changes,
+            // so velocity must be zero. Monotonic pass-through waypoints
+            // are NOT section boundaries — the DoF traverses them without
+            // stopping, and the §III-D iterative tracking scheme ensures
+            // the multi-dim path stays close to the reference polyline.
             for (size_t i = 1; i < n_waypoints_ - 1; ++i) {
+                double p_prev = wp_pos(d, i - 1);
+                double p_curr = wp_pos(d, i);
+                double p_next = wp_pos(d, i + 1);
+                double dir_in  = p_curr - p_prev;
+                double dir_out = p_next - p_curr;
+                // Skip monotonic pass-through (same direction) and flat waypoints
+                if (std::abs(dir_in) < position_eps && std::abs(dir_out) < position_eps)
+                    continue; // flat — no extremum
+                if (dir_in * dir_out > 0.0)
+                    continue; // same direction — monotonic pass-through
+                // Direction change (or one side flat with non-zero other) → local extremum
                 dp.extrema_wp.push_back(i);
-                dp.extrema_pos.push_back(wp_pos(d, i));
+                dp.extrema_pos.push_back(p_curr);
             }
 
             dp.extrema_wp.push_back(n_waypoints_ - 1);
