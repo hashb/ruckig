@@ -576,7 +576,30 @@ class LocalWaypointsCalculator {
         if (dp.total_s < position_eps) return 0.0;
 
         const size_t last_section = dp.seg_lengths.empty() ? 0 : (dp.seg_lengths.size() - 1);
-        for (size_t section = std::min(section_hint, last_section); section < dp.seg_lengths.size(); ++section) {
+        const size_t start_section = std::min(section_hint, last_section);
+
+        // First, check the current section with extended bounds to handle
+        // braking overshoot: when the initial velocity opposes the section
+        // direction, the position can temporarily be outside [p_start, p_end].
+        // Map such overshoot to s = 0 (no progress in this section yet).
+        if (start_section < dp.seg_lengths.size()) {
+            const double p_start = dp.extrema_pos[start_section];
+            const double p_end = dp.extrema_pos[start_section + 1];
+            // Check if p is on the endpoint side of the section
+            const double lo = std::min(p_start, p_end);
+            const double hi = std::max(p_start, p_end);
+            const bool in_extended = (p >= lo - overshoot_tolerance && p <= hi + overshoot_tolerance);
+            // Check if p is in the braking zone (overshoot of p_start)
+            const double sign = (p_end >= p_start) ? 1.0 : -1.0;
+            const bool braking_overshoot =
+                (sign > 0.0 && p < p_start + overshoot_tolerance) ||
+                (sign < 0.0 && p > p_start - overshoot_tolerance);
+            if (in_extended || braking_overshoot) {
+                return tracked_state_to_s(d, start_section, p);
+            }
+        }
+
+        for (size_t section = start_section; section < dp.seg_lengths.size(); ++section) {
             const double p_start = dp.extrema_pos[section];
             const double p_end = dp.extrema_pos[section + 1];
             const double lo = std::min(p_start, p_end) - overshoot_tolerance;
@@ -902,10 +925,31 @@ class LocalWaypointsCalculator {
             c.s_dt = forward_position_to_s(d, section, c.p_dt);
         };
 
-        // Extend position bounds to include p_in so that a slight overshoot
-        // from the previous section does not cause every trajectory to fail.
-        const double bound_lo = std::min({p_in, p_start, p_end});
-        const double bound_hi = std::max({p_in, p_start, p_end});
+        // Position bounds for trajectory validity check.
+        // When the initial velocity opposes the section direction, the
+        // trajectory naturally overshoots the starting position during
+        // braking before reversing. This overshoot is physically necessary
+        // and must be allowed. Estimate the braking overshoot as the
+        // distance traveled while bringing velocity from |v_in| to 0
+        // using the maximum deceleration.
+        const double brake_overshoot =
+            (sign * v_in < 0.0)
+                ? (v_in * v_in) / (2.0 * std::max(std::abs(lim.amin), 1e-6))
+                  + std::abs(a_in) * std::abs(v_in) / (2.0 * std::max(lim.jmax, 1e-6))
+                : 0.0;
+        // bound_lo/bound_hi constrain the trajectory's position extrema.
+        // On the endpoint side, stay within the section. On the starting
+        // side, allow braking overshoot.
+        double bound_lo, bound_hi;
+        if (sign > 0.0) {
+            // Section going up: p_end > p_start.  Starting side is below.
+            bound_lo = std::min({p_in, p_start, p_end}) - brake_overshoot;
+            bound_hi = std::max({p_in, p_start, p_end});
+        } else {
+            // Section going down: p_end < p_start.  Starting side is above.
+            bound_lo = std::min({p_in, p_start, p_end});
+            bound_hi = std::max({p_in, p_start, p_end}) + brake_overshoot;
+        }
 
         // --- Upper (fast) trajectory: position control to (p_end, 0, af_fast).
         double af_upper = af_upper_nominal;
@@ -925,8 +969,8 @@ class LocalWaypointsCalculator {
         // with the smallest feasible positive target acceleration.
         Candidate lower{};
         double af_lower_used = 0.0;  // Track lower target acceleration for intermediate interpolation
-        const double brake_bound_lo = bound_lo - overshoot_tolerance;
-        const double brake_bound_hi = bound_hi + overshoot_tolerance;
+        const double brake_bound_lo = bound_lo - overshoot_tolerance - brake_overshoot;
+        const double brake_bound_hi = bound_hi + overshoot_tolerance + brake_overshoot;
 
         bool brake_valid = false;
         if (solve_brake(p_in, v_in, a_in, lim)) {
