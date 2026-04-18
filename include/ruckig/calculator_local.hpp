@@ -1677,63 +1677,11 @@ public:
             return calculate_core<throw_error>(input, traj, delta_time, was_interrupted);
         }
 
-        // Target alignment: compute core with v=0, a=0 at the target,
-        // then append a post-alignment trajectory to reach the desired
-        // target velocity/acceleration.
-        InputParameter<DOFs, CustomVector> core_input = input;
-        for (size_t d = 0; d < degrees_of_freedom; ++d) {
-            if (!input.enabled[d]) continue;
-            core_input.target_velocity[d] = 0.0;
-            core_input.target_acceleration[d] = 0.0;
-        }
-
-        const Vector<double> zero_velocity = make_zero_vector();
-        const Vector<double> zero_acceleration = make_zero_vector();
-
-        Trajectory<DOFs, CustomVector> main_traj = make_temp_trajectory();
-        Trajectory<DOFs, CustomVector> post_traj = make_temp_trajectory();
-
-        bool main_interrupted = false;
-        bool post_interrupted = false;
-
-        const Result main_res = calculate_core<throw_error>(
-            core_input, main_traj, delta_time, main_interrupted
-        );
-        if (main_res < 0) return main_res;
-
-        {
-            Vector<double> post_start_position = input.target_position;
-            Vector<double> post_start_velocity = zero_velocity;
-            Vector<double> post_start_acceleration = zero_acceleration;
-            if (main_traj.get_duration() > position_eps) {
-                main_traj.at_time(
-                    main_traj.get_duration(),
-                    post_start_position,
-                    post_start_velocity,
-                    post_start_acceleration
-                );
-            }
-
-            const auto post_input = make_alignment_input(
-                input,
-                post_start_position,
-                post_start_velocity,
-                post_start_acceleration,
-                input.target_position,
-                input.target_velocity,
-                input.target_acceleration
-            );
-
-            const Result post_res = segment_calc.template calculate<throw_error>(
-                post_input, post_traj, delta_time, post_interrupted
-            );
-            if (post_res < 0) return post_res;
-        }
-
-        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
-        concatenate_trajectories(pre_traj, main_traj, post_traj, traj);
-        was_interrupted = main_interrupted || post_interrupted;
-        return Result::Working;
+        // The core algorithm handles non-zero target velocity/acceleration
+        // naturally via §III-C last-section solve with exact target state.
+        // Pass all parameters directly to calculate_core — no pre- or
+        // post-alignment wrappers needed.
+        return calculate_core<throw_error>(input, traj, delta_time, was_interrupted);
     }
 
     template<bool throw_error>
