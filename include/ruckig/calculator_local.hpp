@@ -52,7 +52,7 @@ class LocalWaypointsCalculator {
     static constexpr double overshoot_tolerance {1e-9};
     static constexpr double position_eps {1e-12};
     static constexpr int n_tracking_iterations {50};
-    static constexpr double delta_u_ref {0.05};
+    static constexpr double delta_u_ref {0.01};
 
     double sim_dt {0.0025};
 
