@@ -11,14 +11,15 @@ pip install -e . 2>&1 | tail -1
 OUTPUT=$(python examples/18_waypoints_backend_compare.py 2>&1)
 
 # Extract metrics from the output
-LOCAL_DUR=$(echo "$OUTPUT" | grep "^local  duration" | awk '{print $4}')
-CLOUD_DUR=$(echo "$OUTPUT" | grep "^cloud  duration" | awk '{print $4}')
+LOCAL_DUR=$(echo "$OUTPUT" | grep "^local  duration" | sed 's/.*= //' | sed 's/ s//')
+CLOUD_DUR=$(echo "$OUTPUT" | grep "^cloud  duration" | sed 's/.*= //' | sed 's/ s//')
 
-LOCAL_MAX_DEV=$(echo "$OUTPUT" | grep "^\s*local " | head -1 | awk '{print $2}' | sed 's/max=//')
-CLOUD_MAX_DEV=$(echo "$OUTPUT" | grep "^\s*cloud " | head -1 | awk '{print $2}' | sed 's/max=//')
+# Deviation lines look like: "  local   max=0.265393  mean=0.096482  ..."
+LOCAL_MAX_DEV=$(echo "$OUTPUT" | grep '^  local ' | head -1 | grep -oP 'max=\K[0-9.]+')
+CLOUD_MAX_DEV=$(echo "$OUTPUT" | grep '^  cloud ' | head -1 | grep -oP 'max=\K[0-9.]+')
 
-LOCAL_MEAN_DEV=$(echo "$OUTPUT" | grep "^\s*local " | head -1 | awk '{print $3}' | sed 's/mean=//')
-CLOUD_MEAN_DEV=$(echo "$OUTPUT" | grep "^\s*cloud " | head -1 | awk '{print $3}' | sed 's/mean=//')
+LOCAL_MEAN_DEV=$(echo "$OUTPUT" | grep '^  local ' | head -1 | grep -oP 'mean=\K[0-9.]+')
+CLOUD_MEAN_DEV=$(echo "$OUTPUT" | grep '^  cloud ' | head -1 | grep -oP 'mean=\K[0-9.]+')
 
 # Check kinematic pass/fail
 KINEMATIC_PASS="true"
