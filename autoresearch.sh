@@ -21,9 +21,45 @@ CLOUD_MAX_DEV=$(echo "$OUTPUT" | grep '^  cloud ' | head -1 | grep -oP 'max=\K[0
 LOCAL_MEAN_DEV=$(echo "$OUTPUT" | grep '^  local ' | head -1 | grep -oP 'mean=\K[0-9.]+')
 CLOUD_MEAN_DEV=$(echo "$OUTPUT" | grep '^  cloud ' | head -1 | grep -oP 'mean=\K[0-9.]+')
 
-# Check kinematic pass/fail
+# Check kinematic pass/fail AND end state accuracy
 KINEMATIC_PASS="true"
 if echo "$OUTPUT" | grep -q "FAIL"; then
+    KINEMATIC_PASS="false"
+fi
+
+# Also verify end state accuracy
+END_STATE_OK=$(python3 -c "
+import sys
+sys.path.insert(0, '/home/hashb/workspace/ruckig/.venv/lib/python3.11/site-packages')
+try:
+    from ruckig import InputParameter, OutputParameter, Result, Ruckig, WaypointsBackend
+    import numpy as np
+    inp = InputParameter(3)
+    inp.current_position = [0.2, 0, -0.3]
+    inp.current_velocity = [0, 0.2, 0]
+    inp.current_acceleration = [0, 0.6, 0]
+    inp.intermediate_positions = [[1.4,-1.6,1.0],[-0.6,-0.5,0.4],[-0.4,-0.35,0.0],[0.8,1.8,-0.1]]
+    inp.target_position = [0.5, 1, 0]
+    inp.target_velocity = [0.2, 0, 0.3]
+    inp.target_acceleration = [0, 0.1, -0.1]
+    inp.max_velocity = [1, 2, 1]; inp.max_acceleration = [3, 2, 2]; inp.max_jerk = [6, 10, 20]
+    otg = Ruckig(3, 0.01, 10)
+    otg.set_waypoints_backend(WaypointsBackend.Local)
+    out = OutputParameter(3, 10)
+    while True:
+        res = otg.update(inp, out)
+        out.pass_to_input(inp)
+        if res != 1: break
+    traj = out.trajectory
+    p, v, a = traj.at_time(traj.duration)
+    p_err = max(abs(p[i] - [0.5,1,0][i]) for i in range(3))
+    v_err = max(abs(v[i] - [0.2,0,0.3][i]) for i in range(3))
+    ok = p_err < 0.05 and v_err < 0.1
+    print('true' if ok else 'false')
+except Exception as e:
+    print('false')
+" 2>/dev/null)
+if [ "$END_STATE_OK" != "true" ]; then
     KINEMATIC_PASS="false"
 fi
 

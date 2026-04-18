@@ -35,28 +35,16 @@ Current state:
 ## What's Been Tried
 (Updated as experiments accumulate)
 
-### Major Wins
-1. **True local extrema only** (§III-B) - Removed forced v=0 at monotonic pass-through waypoints. Duration 9.81→8.59s
-2. **Remove pre-alignment** - Pass initial v/a directly to core instead of braking to rest first. Duration 8.59→8.20s
-3. **Fix forward_position_to_s for braking overshoot** - When initial velocity opposes section direction, the position overshoots p_start during braking. The forward_position_to_s function was mapping these positions to wrong sections, corrupting s_dt and m calculations. Duration 8.20→7.87s (matching cloud!)
-4. **Extended section bounds for braking overshoot** - Upper/lower trajectory validity checks now allow overshoot on the starting side
+### Root Cause Analysis
+The paper says per-DoF sections should be between TRUE LOCAL EXTREMA only (where direction changes). The current `build_geometry()` includes EVERY multi-dim waypoint as a section boundary, forcing v=0 at every waypoint for every DoF. This is overly conservative and causes the ~25% duration gap.
 
-### Dead Ends
-- **More tracking iterations (100)** - No change, already converged at 50
-- **Smaller delta_u_ref (0.005)** - Worse duration, kinematic failure
-- **Larger delta_u_ref (0.02)** - Slightly worse on all metrics
-- **Set a=m*af_fast at section transitions** - Kinematic failure, jerk limit violations
-- **Smaller sim_dt (0.001)** - No improvement in deviation, slower compute
-- **All waypoints as section boundaries** - Duration much worse (9.21→10.43s), deviation barely improves
-- **Pass-through velocity at waypoints** - Catastrophic: broke tracking scheme
+The paper's §III-B explicitly states: "The intermediate waypoints pI and pII are local extrema of the path. Consequently, their corresponding velocities also need to be zero." — only for local extrema.
 
-### Root Cause of Remaining Deviation (0.42 vs cloud 0.26)
-The deviation is caused by DoFs being at DIFFERENT u values near waypoints. Each DoF passes through pass-through waypoints accurately, but at different times. At any given time, DoFs are at different progress levels, causing the combined position to deviate from the reference polyline.
-
-The cloud API avoids this by stopping at every waypoint (v=0), naturally synchronizing all DoFs. The paper's algorithm only enforces synchronization at true local extrema.
+The paper's §III-D tracking scheme ensures all DoFs approximately pass through every waypoint via the u_ref parameter, even without forcing v=0.
 
 ### Experiment Ideas (priority order)
-1. **Improve u_ref initialization** - Include waypoint timing constraints so u_ref aligns all DoFs at each waypoint
-2. **Waypoint-enforced u_ref checkpoints** - After initial tracking, add u_ref corrections at each waypoint
-3. **Modified update_u_ref** - Use path deviation (distance to polyline) instead of position deviation
-4. **Two-phase tracking** - First phase matches duration, second phase optimizes deviation
+1. **Switch build_geometry to true local extrema only** — The biggest win. Remove the code that includes every waypoint; only include waypoints where the per-DoF direction actually changes (or at start/end).
+2. **Improve online tracking for monotonic sections** — When a DoF passes through a waypoint without stopping, ensure the u_ref tracking keeps it close to the waypoint position.
+3. **Refine binary search for accel ranges** — The current binary search is correct per the paper; likely not a major source of duration difference.
+4. **Adjust sim_dt and tracking parameters** — May need finer discretization for smooth section transitions.
+5. **Handle section transitions with non-zero velocity** — After switching to true extrema, sections that span multiple waypoints will need to handle non-zero velocity at intermediate waypoints correctly.
