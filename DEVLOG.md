@@ -8,3 +8,8 @@
   - compute feasible waypoint accelerations for each one-dimensional path with binary search;
   - construct upper and lower jerk-limited trajectories for bounded progress;
   - use mapping factors to track a shared multi-dimensional path-length reference.
+- Implemented an initial local calculator checkpoint:
+  - scalar Ruckig calls for point-to-point jerk-limited motion;
+  - binary searches for feasible incoming/outgoing waypoint accelerations;
+  - section-wise multi-DoF trajectory assembly using the existing `Trajectory` profile storage.
+- Verified the checkpoint with the requested Python example. Kinematic limits pass, but duration is still high because every sampled waypoint is treated as a stop; the next implementation slice will collapse each one-dimensional path to its extrema, matching the paper's Section III-B setup more closely.
