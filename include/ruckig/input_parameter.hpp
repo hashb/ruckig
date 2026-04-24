@@ -66,7 +66,7 @@ class InputParameter {
         enabled.resize(dofs);
     }
 
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
     void reserve(size_t max_number_of_waypoints) {
         intermediate_positions.reserve(max_number_of_waypoints);
     }
@@ -134,7 +134,7 @@ public:
         initialize();
     }
 
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
     template<size_t D = DOFs, typename std::enable_if<(D >= 1), int>::type = 0>
     InputParameter(size_t max_number_of_waypoints): degrees_of_freedom(DOFs) {
         reserve(max_number_of_waypoints);
