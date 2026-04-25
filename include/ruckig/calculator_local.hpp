@@ -721,6 +721,7 @@ class LocalWaypointsCalculator {
 
         std::vector<std::vector<double>> desired_position(steps + 1, std::vector<double>(degrees_of_freedom, 0.0));
         std::vector<std::vector<double>> desired_velocity(steps + 1, std::vector<double>(degrees_of_freedom, 0.0));
+        std::vector<std::vector<double>> desired_acceleration(steps + 1, std::vector<double>(degrees_of_freedom, 0.0));
         std::vector<ScalarLimits> global_limits;
         global_limits.reserve(degrees_of_freedom);
         for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
@@ -739,6 +740,8 @@ class LocalWaypointsCalculator {
         for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
             desired_velocity.front()[dof] = input.current_velocity[dof];
             desired_velocity.back()[dof] = input.target_velocity[dof];
+            desired_acceleration.front()[dof] = input.current_acceleration[dof];
+            desired_acceleration.back()[dof] = input.target_acceleration[dof];
         }
 
         std::vector<std::vector<Profile>> generated_profiles;
@@ -763,7 +766,7 @@ class LocalWaypointsCalculator {
             for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
                 auto plan = plan_scalar(
                     current_position[dof], current_velocity[dof], current_acceleration[dof],
-                    desired_position[step + 1][dof], desired_velocity[step + 1][dof], 0.0,
+                    desired_position[step + 1][dof], desired_velocity[step + 1][dof], desired_acceleration[step + 1][dof],
                     global_limits[dof],
                     dt
                 );
