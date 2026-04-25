@@ -81,9 +81,34 @@ def make_input():
     inp.max_jerk = [300.0, 150.0, 200.0, 250.0, 300.0, 400.0, 400.0]
     return inp
 
+def make_input_04():
+    inp = InputParameter(3)
+    inp.current_position = [0.2, 0, -0.3]
+    inp.current_velocity = [0, 0.2, 0]
+    inp.current_acceleration = [0, 0.6, 0]
+
+    inp.intermediate_positions = [
+        [1.4, -1.6, 1.0],
+        [-0.6, -0.5, 0.4],
+        [-0.4, -0.35, 0.0],
+        [0.8, 1.8, -0.1],
+    ]
+
+    inp.target_position = [0.5, 1, 0]
+    inp.target_velocity = [0.2, 0, 0.3]
+    inp.target_acceleration = [0, 0.1, -0.1]
+
+    inp.max_velocity = [1, 2, 1]
+    inp.max_acceleration = [3, 2, 2]
+    inp.max_jerk = [6, 10, 20]
+    return inp
 
 def run_backend(backend, label):
-    inp = make_input()
+    # inp = make_input()
+
+    inp = make_input_04()
+    DOFS = inp.degrees_of_freedom
+
     max_waypoints = len(inp.intermediate_positions)
 
     otg = Ruckig(DOFS, CONTROL_CYCLE, max_waypoints)
@@ -597,7 +622,7 @@ if __name__ == "__main__":
     if len(runs) == 0:
         raise SystemExit("no backends produced a trajectory")
 
-    inp_ref = make_input()
+    inp_ref = make_input_04()
     ref_poly = build_reference_polyline(inp_ref)
 
     # ---- kinematic-validity check ----
