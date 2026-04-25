@@ -40,6 +40,7 @@ class Trajectory {
 
     double duration {0.0};
     Container<double> cumulative_times;
+    Container<size_t> public_sections;
 
     Vector<double> independent_min_durations;
     Vector<Bound> position_extrema;
@@ -51,6 +52,10 @@ class Trajectory {
     void resize(size_t max_number_of_waypoints) {
         profiles.resize(max_number_of_waypoints + 1);
         cumulative_times.resize(max_number_of_waypoints + 1);
+        public_sections.resize(max_number_of_waypoints + 1);
+        for (size_t i = 0; i < public_sections.size(); ++i) {
+            public_sections[i] = i;
+        }
     }
 
     template<size_t D = DOFs, typename std::enable_if<(D == 0), int>::type = 0>
@@ -68,29 +73,30 @@ class Trajectory {
     void state_to_integrate_from(double time, size_t& new_section, Func&& set_integrate) const {
         if (time >= duration) {
             // Keep constant acceleration
-            new_section = profiles.size();
+            const size_t internal_section = profiles.size();
             const auto& profiles_dof = profiles.back();
             for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
                 const double t_pre = (profiles.size() > 1) ? cumulative_times[cumulative_times.size() - 2] : profiles_dof[dof].brake.duration;
                 const double t_diff = time - (t_pre + profiles_dof[dof].t_sum.back());
                 set_integrate(dof, t_diff, profiles_dof[dof].p.back(), profiles_dof[dof].v.back(), profiles_dof[dof].a.back(), 0.0);
             }
+            new_section = public_section_from_internal(internal_section);
             return;
         }
 
         const auto new_section_ptr = std::upper_bound(cumulative_times.begin(), cumulative_times.end(), time);
-        new_section = std::distance(cumulative_times.begin(), new_section_ptr);
+        const size_t internal_section = std::distance(cumulative_times.begin(), new_section_ptr);
         double t_diff = time;
-        if (new_section > 0) {
-            t_diff -= cumulative_times[new_section - 1];
+        if (internal_section > 0) {
+            t_diff -= cumulative_times[internal_section - 1];
         }
 
         for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
-            const Profile& p = profiles[new_section][dof];
+            const Profile& p = profiles[internal_section][dof];
             double t_diff_dof = t_diff;
 
             // Brake pre-trajectory
-            if (new_section == 0 && p.brake.duration > 0) {
+            if (internal_section == 0 && p.brake.duration > 0) {
                 if (t_diff_dof < p.brake.duration) {
                     const size_t index = (t_diff_dof < p.brake.t[0]) ? 0 : 1;
                     if (index > 0) {
@@ -143,6 +149,19 @@ class Trajectory {
 
             set_integrate(dof, t_diff_dof, p.p[index_dof], p.v[index_dof], p.a[index_dof], p.j[index_dof]);
         }
+        new_section = public_section_from_internal(internal_section);
+    }
+
+    size_t public_section_from_internal(size_t internal_section) const {
+#if defined RUCKIG_TRAJECTORY_HAS_WAYPOINTS
+        if (public_sections.size() == profiles.size()) {
+            if (internal_section >= profiles.size()) {
+                return public_sections.empty() ? internal_section : public_sections.back() + 1;
+            }
+            return public_sections[internal_section];
+        }
+#endif
+        return internal_section;
     }
 
 public:

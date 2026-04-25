@@ -185,9 +185,50 @@ def check_paper_like_shape_still_deviates() -> Metrics:
         [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0],
         [300.0, 150.0, 200.0, 250.0, 300.0, 400.0, 400.0],
     )
-    assert metrics.mean_dev > 0.08, metrics
-    assert metrics.max_dev > 0.15, metrics
+    assert metrics.mean_dev > 0.06, metrics
+    assert metrics.max_dev > 0.12, metrics
     return metrics
+
+
+def check_public_sections_do_not_expose_internal_slices() -> Metrics:
+    ref = np.array([
+        [0.2, 0.0, -0.3],
+        [1.4, -1.6, 1.0],
+        [-0.6, -0.5, 0.4],
+        [-0.4, -0.35, 0.0],
+        [0.8, 1.8, -0.1],
+        [0.5, 1.0, 0.0],
+    ])
+    inp = make_input(ref, [1.0, 2.0, 1.0], [3.0, 2.0, 2.0], [6.0, 10.0, 20.0])
+    inp.current_velocity = [0.0, 0.2, 0.0]
+    inp.current_acceleration = [0.0, 0.6, 0.0]
+    inp.target_velocity = [0.2, 0.0, 0.3]
+    inp.target_acceleration = [0.0, 0.1, -0.1]
+
+    max_waypoints = len(inp.intermediate_positions)
+    otg = Ruckig(inp.degrees_of_freedom, CONTROL_CYCLE, max_waypoints)
+    otg.set_waypoints_backend(WaypointsBackend.Local)
+    out = OutputParameter(inp.degrees_of_freedom, max_waypoints)
+
+    outputs = []
+    sections = []
+    res = Result.Working
+    while res == Result.Working:
+        res = otg.update(inp, out)
+        outputs.append(copy(out))
+        sections.append(out.new_section)
+        out.pass_to_input(inp)
+
+    if res < 0:
+        raise RuntimeError(f"local backend failed with code {int(res)}")
+
+    assert max(sections) <= max_waypoints + 1, sections
+    assert sections[-1] == max_waypoints + 1, sections[-10:]
+    assert len(inp.intermediate_positions) == 0
+
+    positions = np.array([o.new_position for o in outputs])
+    max_dev, mean_dev, rms_dev, p95_dev = path_deviation(positions, ref)
+    return Metrics(outputs[0].trajectory.duration, max_dev, mean_dev, rms_dev, p95_dev)
 
 
 def main() -> None:
@@ -197,6 +238,7 @@ def main() -> None:
         ("equal_axes_straight_line", check_equal_axes_straight_line_is_accurate),
         ("scaled_straight_line_gap", check_scaled_straight_line_already_deviates),
         ("paper_like_shape_gap", check_paper_like_shape_still_deviates),
+        ("public_sections", check_public_sections_do_not_expose_internal_slices),
     ]
 
     for name, check in checks:

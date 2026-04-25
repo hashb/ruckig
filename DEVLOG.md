@@ -20,3 +20,8 @@
   - pack any Ruckig brake pre-trajectory into those short sections so later trajectory sections remain acceleration-continuous.
 - Verified with the requested command. Local backend duration on `examples/18_waypoints_backend_compare.py` is 2.5396 s and the sampled velocity, acceleration, and jerk checks pass.
 - Ran `test/local_waypoints_diagnostics.py`; all diagnostic checks pass.
+- Fixed waypoint handling for local trajectories with internal tracking slices:
+  - added an internal-to-public section mapping in `Trajectory` so `OutputParameter.pass_to_input` only removes original intermediate waypoints, not local backend tracking slices;
+  - changed scalar-position to path-length mapping to interpolate through the original waypoint span instead of linearly between compressed extrema endpoints;
+  - added a diagnostic that catches public section numbers leaking internal slice indices.
+- Verified the user-provided `make_input_04` path in `examples/18_waypoints_backend_compare.py`: local kinematic validation passes, local duration is 8.1286 s, and local path-deviation max/mean are 0.166686 / 0.095980.

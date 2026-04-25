@@ -628,24 +628,37 @@ class LocalWaypointsCalculator {
         return points[section][dof] + alpha * (points[section + 1][dof] - points[section][dof]);
     }
 
-    static double path_length_from_scalar_state(const ScalarPath& path, const std::vector<double>& arc, size_t scalar_section, double position) {
+    static double path_length_from_scalar_state(const ScalarPath& path, const std::vector<std::vector<double>>& points, const std::vector<double>& arc, size_t scalar_section, size_t dof, double position) {
         if (path.point_indices.size() < 2 || scalar_section + 1 >= path.point_indices.size()) {
             return arc.back();
         }
 
         const size_t path_start = path.point_indices[scalar_section];
         const size_t path_end = path.point_indices[scalar_section + 1];
-        const double p0 = path.positions[scalar_section];
-        const double p1 = path.positions[scalar_section + 1];
-        double alpha = 0.0;
-        if (std::abs(p1 - p0) > eps) {
-            alpha = (position - p0) / (p1 - p0);
+
+        for (size_t point = path_start; point < path_end; ++point) {
+            const double p0 = points[point][dof];
+            const double p1 = points[point + 1][dof];
+            if (std::abs(p1 - p0) < eps) {
+                continue;
+            }
+
+            const double lower = std::min(p0, p1) - 1e-9;
+            const double upper = std::max(p0, p1) + 1e-9;
+            if (position < lower || position > upper) {
+                continue;
+            }
+
+            const double alpha = std::clamp((position - p0) / (p1 - p0), 0.0, 1.0);
+            return arc[point] + alpha * (arc[point + 1] - arc[point]);
         }
-        alpha = std::clamp(alpha, 0.0, 1.0);
-        return arc[path_start] + alpha * (arc[path_end] - arc[path_start]);
+
+        const double start_distance = std::abs(position - points[path_start][dof]);
+        const double end_distance = std::abs(position - points[path_end][dof]);
+        return start_distance <= end_distance ? arc[path_start] : arc[path_end];
     }
 
-    static double reference_path_length_at_time(const ScalarPath& path, const std::vector<double>& arc, double time) {
+    static double reference_path_length_at_time(const ScalarPath& path, const std::vector<std::vector<double>>& points, const std::vector<double>& arc, size_t dof, double time) {
         if (time >= path.duration - eps) {
             return arc.back();
         }
@@ -654,7 +667,7 @@ class LocalWaypointsCalculator {
         const double profile_start = (profile_index == 0) ? 0.0 : path.cumulative_times[profile_index - 1];
         const double offset = std::max(0.0, time - profile_start);
         const auto state = state_at_profile_time(path.timed_plans[profile_index].profile, offset);
-        return path_length_from_scalar_state(path, arc, profile_index, std::get<0>(state));
+        return path_length_from_scalar_state(path, points, arc, profile_index, dof, std::get<0>(state));
     }
 
     bool assemble_tracking_trajectory(
@@ -701,7 +714,7 @@ class LocalWaypointsCalculator {
 
         std::vector<double> reference_u(steps + 1, 0.0);
         for (size_t i = 0; i <= steps; ++i) {
-            reference_u[i] = reference_path_length_at_time(scalar_paths[reference_dof], arc, times[i]);
+            reference_u[i] = reference_path_length_at_time(scalar_paths[reference_dof], points, arc, reference_dof, times[i]);
         }
         reference_u.front() = 0.0;
         reference_u.back() = arc.back();
@@ -717,6 +730,7 @@ class LocalWaypointsCalculator {
         for (size_t i = 0; i <= steps; ++i) {
             for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
                 desired_position[i][dof] = position_at_path_length(points, arc, dof, reference_u[i]);
+                desired_velocity[i][dof] = 0.0;
             }
         }
 
@@ -731,6 +745,8 @@ class LocalWaypointsCalculator {
         generated_profiles.reserve(steps + 1);
         std::vector<double> generated_durations;
         generated_durations.reserve(steps + 1);
+        std::vector<size_t> generated_public_sections;
+        generated_public_sections.reserve(steps + 1);
 
         std::vector<double> current_position = points.front();
         std::vector<double> current_velocity(degrees_of_freedom, 0.0);
@@ -769,6 +785,7 @@ class LocalWaypointsCalculator {
 
             generated_profiles.push_back(section_profiles);
             generated_durations.push_back(dt);
+            generated_public_sections.push_back(arc_segment_at(arc, reference_u[step]));
         }
 
         bool needs_final_profile = false;
@@ -812,6 +829,7 @@ class LocalWaypointsCalculator {
             }
             generated_profiles.push_back(final_profiles);
             generated_durations.push_back(final_duration);
+            generated_public_sections.push_back(points.size() - 2);
         }
 
         trajectory.resize(generated_profiles.size() - 1);
@@ -822,6 +840,7 @@ class LocalWaypointsCalculator {
         for (size_t section = 0; section < generated_profiles.size(); ++section) {
             cumulative_time += generated_durations[section];
             trajectory.cumulative_times[section] = cumulative_time;
+            trajectory.public_sections[section] = generated_public_sections[section];
             for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
                 trajectory.profiles[section][dof] = generated_profiles[section][dof];
             }
@@ -914,10 +933,22 @@ public:
             trajectory.independent_min_durations[dof] = scalar_paths[dof].fastest_duration;
         }
 
+        const auto fallback_arc = path_arc_lengths(points);
+        size_t reference_dof = 0;
+        for (size_t dof = 1; dof < degrees_of_freedom; ++dof) {
+            if (scalar_paths[dof].fastest_duration > scalar_paths[reference_dof].fastest_duration) {
+                reference_dof = dof;
+            }
+        }
+
         for (size_t section = 0; section < trajectory_section_count; ++section) {
             const double section_start = global_times[section];
             const double section_end = global_times[section + 1];
             trajectory.cumulative_times[section] = section_end;
+            if (fallback_arc.size() > 1 && fallback_arc.back() > eps) {
+                const double reference_u = reference_path_length_at_time(scalar_paths[reference_dof], points, fallback_arc, reference_dof, section_start);
+                trajectory.public_sections[section] = arc_segment_at(fallback_arc, reference_u);
+            }
 
             for (size_t dof = 0; dof < degrees_of_freedom; ++dof) {
                 const auto& path = scalar_paths[dof];
