@@ -272,17 +272,26 @@ class LocalWaypointsCalculator {
             dp.extrema_wp.push_back(0);
             dp.extrema_pos.push_back(wp_pos(d, 0));
 
-            // Include every multi-dim waypoint as a per-DoF section boundary,
-            // not only true local extrema. On monotonic pass-throughs the
-            // v=0 requirement at the boundary slows this DoF down a little,
-            // but it prevents the DoF from flying past intermediate waypoints
-            // that it would otherwise "skip" (no sign flip ⇒ skipped by the
-            // strict-extrema rule). This keeps the tracked path aligned with
-            // the reference polyline at every waypoint, at the cost of a
-            // small duration increase.
+            // Per paper §III-B: only true local extrema are section
+            // boundaries. At a local extremum the per-DoF direction changes,
+            // so velocity must be zero. Monotonic pass-through waypoints
+            // are NOT section boundaries — the DoF traverses them without
+            // stopping, and the §III-D iterative tracking scheme ensures
+            // the multi-dim path stays close to the reference polyline.
             for (size_t i = 1; i < n_waypoints_ - 1; ++i) {
+                double p_prev = wp_pos(d, i - 1);
+                double p_curr = wp_pos(d, i);
+                double p_next = wp_pos(d, i + 1);
+                double dir_in  = p_curr - p_prev;
+                double dir_out = p_next - p_curr;
+                // Skip monotonic pass-through (same direction) and flat waypoints
+                if (std::abs(dir_in) < position_eps && std::abs(dir_out) < position_eps)
+                    continue; // flat — no extremum
+                if (dir_in * dir_out > 0.0)
+                    continue; // same direction — monotonic pass-through
+                // Direction change (or one side flat with non-zero other) → local extremum
                 dp.extrema_wp.push_back(i);
-                dp.extrema_pos.push_back(wp_pos(d, i));
+                dp.extrema_pos.push_back(p_curr);
             }
 
             dp.extrema_wp.push_back(n_waypoints_ - 1);
@@ -567,7 +576,30 @@ class LocalWaypointsCalculator {
         if (dp.total_s < position_eps) return 0.0;
 
         const size_t last_section = dp.seg_lengths.empty() ? 0 : (dp.seg_lengths.size() - 1);
-        for (size_t section = std::min(section_hint, last_section); section < dp.seg_lengths.size(); ++section) {
+        const size_t start_section = std::min(section_hint, last_section);
+
+        // First, check the current section with extended bounds to handle
+        // braking overshoot: when the initial velocity opposes the section
+        // direction, the position can temporarily be outside [p_start, p_end].
+        // Map such overshoot to s = 0 (no progress in this section yet).
+        if (start_section < dp.seg_lengths.size()) {
+            const double p_start = dp.extrema_pos[start_section];
+            const double p_end = dp.extrema_pos[start_section + 1];
+            // Check if p is on the endpoint side of the section
+            const double lo = std::min(p_start, p_end);
+            const double hi = std::max(p_start, p_end);
+            const bool in_extended = (p >= lo - overshoot_tolerance && p <= hi + overshoot_tolerance);
+            // Check if p is in the braking zone (overshoot of p_start)
+            const double sign = (p_end >= p_start) ? 1.0 : -1.0;
+            const bool braking_overshoot =
+                (sign > 0.0 && p < p_start + overshoot_tolerance) ||
+                (sign < 0.0 && p > p_start - overshoot_tolerance);
+            if (in_extended || braking_overshoot) {
+                return tracked_state_to_s(d, start_section, p);
+            }
+        }
+
+        for (size_t section = start_section; section < dp.seg_lengths.size(); ++section) {
             const double p_start = dp.extrema_pos[section];
             const double p_end = dp.extrema_pos[section + 1];
             const double lo = std::min(p_start, p_end) - overshoot_tolerance;
@@ -893,10 +925,31 @@ class LocalWaypointsCalculator {
             c.s_dt = forward_position_to_s(d, section, c.p_dt);
         };
 
-        // Extend position bounds to include p_in so that a slight overshoot
-        // from the previous section does not cause every trajectory to fail.
-        const double bound_lo = std::min({p_in, p_start, p_end});
-        const double bound_hi = std::max({p_in, p_start, p_end});
+        // Position bounds for trajectory validity check.
+        // When the initial velocity opposes the section direction, the
+        // trajectory naturally overshoots the starting position during
+        // braking before reversing. This overshoot is physically necessary
+        // and must be allowed. Estimate the braking overshoot as the
+        // distance traveled while bringing velocity from |v_in| to 0
+        // using the maximum deceleration.
+        const double brake_overshoot =
+            (sign * v_in < 0.0)
+                ? (v_in * v_in) / (2.0 * std::max(std::abs(lim.amin), 1e-6))
+                  + std::abs(a_in) * std::abs(v_in) / (2.0 * std::max(lim.jmax, 1e-6))
+                : 0.0;
+        // bound_lo/bound_hi constrain the trajectory's position extrema.
+        // On the endpoint side, stay within the section. On the starting
+        // side, allow braking overshoot.
+        double bound_lo, bound_hi;
+        if (sign > 0.0) {
+            // Section going up: p_end > p_start.  Starting side is below.
+            bound_lo = std::min({p_in, p_start, p_end}) - brake_overshoot;
+            bound_hi = std::max({p_in, p_start, p_end});
+        } else {
+            // Section going down: p_end < p_start.  Starting side is above.
+            bound_lo = std::min({p_in, p_start, p_end});
+            bound_hi = std::max({p_in, p_start, p_end}) + brake_overshoot;
+        }
 
         // --- Upper (fast) trajectory: position control to (p_end, 0, af_fast).
         double af_upper = af_upper_nominal;
@@ -916,8 +969,8 @@ class LocalWaypointsCalculator {
         // with the smallest feasible positive target acceleration.
         Candidate lower{};
         double af_lower_used = 0.0;  // Track lower target acceleration for intermediate interpolation
-        const double brake_bound_lo = bound_lo - overshoot_tolerance;
-        const double brake_bound_hi = bound_hi + overshoot_tolerance;
+        const double brake_bound_lo = bound_lo - overshoot_tolerance - brake_overshoot;
+        const double brake_bound_hi = bound_hi + overshoot_tolerance + brake_overshoot;
 
         bool brake_valid = false;
         if (solve_brake(p_in, v_in, a_in, lim)) {
@@ -1611,15 +1664,25 @@ public:
         const bool align_current = needs_alignment_at_current(input);
         const bool align_target = needs_alignment_at_target(input);
 
-        if (!align_current && !align_target) {
+        // When only the current state needs alignment (non-zero initial
+        // velocity/acceleration), pass the actual initial state directly
+        // to calculate_core instead of doing a separate pre-alignment
+        // trajectory. The core algorithm naturally handles non-zero initial
+        // states — Ruckig computes trajectories from arbitrary (p,v,a) to
+        // the first per-DoF extremum, and the online tracking scheme (§III-C)
+        // naturally brings v to 0 at each extremum. A separate
+        // pre-alignment wastes time by braking to rest at the current
+        // position instead of braking toward the first waypoint.
+        if (!align_target) {
             return calculate_core<throw_error>(input, traj, delta_time, was_interrupted);
         }
 
+        // Target alignment: compute core with v=0, a=0 at the target,
+        // then append a post-alignment trajectory to reach the desired
+        // target velocity/acceleration.
         InputParameter<DOFs, CustomVector> core_input = input;
         for (size_t d = 0; d < degrees_of_freedom; ++d) {
             if (!input.enabled[d]) continue;
-            core_input.current_velocity[d] = 0.0;
-            core_input.current_acceleration[d] = 0.0;
             core_input.target_velocity[d] = 0.0;
             core_input.target_acceleration[d] = 0.0;
         }
@@ -1627,52 +1690,18 @@ public:
         const Vector<double> zero_velocity = make_zero_vector();
         const Vector<double> zero_acceleration = make_zero_vector();
 
-        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
         Trajectory<DOFs, CustomVector> main_traj = make_temp_trajectory();
         Trajectory<DOFs, CustomVector> post_traj = make_temp_trajectory();
 
-        bool pre_interrupted = false;
         bool main_interrupted = false;
         bool post_interrupted = false;
-
-        if (align_current) {
-            // Pre-alignment: brake from (current_vel, current_acc) to v=0,
-            // a=0 at (approximately) the current position. The braking
-            // overshoot is small and the core trajectory then handles the
-            // full path from start through all intermediate waypoints.
-            Vector<double> pre_target = input.current_position;
-
-            const auto pre_input = make_alignment_input(
-                input,
-                input.current_position,
-                input.current_velocity,
-                input.current_acceleration,
-                pre_target,
-                zero_velocity,
-                zero_acceleration
-            );
-
-            const Result pre_res = segment_calc.template calculate<throw_error>(
-                pre_input, pre_traj, delta_time, pre_interrupted
-            );
-            if (pre_res < 0) return pre_res;
-
-            if (pre_traj.get_duration() > position_eps) {
-                pre_traj.at_time(
-                    pre_traj.get_duration(),
-                    core_input.current_position,
-                    core_input.current_velocity,
-                    core_input.current_acceleration
-                );
-            }
-        }
 
         const Result main_res = calculate_core<throw_error>(
             core_input, main_traj, delta_time, main_interrupted
         );
         if (main_res < 0) return main_res;
 
-        if (align_target) {
+        {
             Vector<double> post_start_position = input.target_position;
             Vector<double> post_start_velocity = zero_velocity;
             Vector<double> post_start_acceleration = zero_acceleration;
@@ -1701,8 +1730,9 @@ public:
             if (post_res < 0) return post_res;
         }
 
+        Trajectory<DOFs, CustomVector> pre_traj = make_temp_trajectory();
         concatenate_trajectories(pre_traj, main_traj, post_traj, traj);
-        was_interrupted = pre_interrupted || main_interrupted || post_interrupted;
+        was_interrupted = main_interrupted || post_interrupted;
         return Result::Working;
     }
 
