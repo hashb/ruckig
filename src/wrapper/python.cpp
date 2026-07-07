@@ -49,6 +49,13 @@ limited by velocity, acceleration, and jerk constraints.";
         .value("ErrorSynchronizationCalculation", Result::ErrorSynchronizationCalculation)
         .export_values();
 
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
+    nb::enum_<WaypointsBackend>(m, "WaypointsBackend")
+        .value("Cloud", WaypointsBackend::Cloud)
+        .value("Local", WaypointsBackend::Local)
+        .export_values();
+#endif
+
     nb::exception<RuckigError>(m, "RuckigError");
 
     nb::class_<Bound>(m, "Bound")
@@ -60,7 +67,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<Trajectory<DynamicDOFs>>(m, "Trajectory")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &Trajectory<DynamicDOFs>::degrees_of_freedom)
@@ -86,7 +93,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<InputParameter<DynamicDOFs>>(m, "InputParameter")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &InputParameter<DynamicDOFs>::degrees_of_freedom)
@@ -126,7 +133,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<OutputParameter<DynamicDOFs>>(m, "OutputParameter")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &OutputParameter<DynamicDOFs>::degrees_of_freedom)
@@ -150,9 +157,11 @@ limited by velocity, acceleration, and jerk constraints.";
     nb::class_<RuckigThrow<DynamicDOFs>>(m, "Ruckig")
         .def(nb::init<size_t>(), "dofs"_a)
         .def(nb::init<size_t, double>(), "dofs"_a, "delta_time"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
         .def(nb::init<size_t, double, size_t>(), "dofs"_a, "delta_time"_a, "max_number_of_waypoints"_a=0)
         .def("filter_intermediate_positions", &RuckigThrow<DynamicDOFs>::filter_intermediate_positions, "input"_a, "threshold_distance"_a)
+        .def("set_waypoints_backend", &RuckigThrow<DynamicDOFs>::set_waypoints_backend, "backend"_a)
+        .def("get_waypoints_backend", &RuckigThrow<DynamicDOFs>::get_waypoints_backend)
 #endif
         .def_ro("max_number_of_waypoints", &RuckigThrow<DynamicDOFs>::max_number_of_waypoints)
         .def_ro("degrees_of_freedom", &RuckigThrow<DynamicDOFs>::degrees_of_freedom)
