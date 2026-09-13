@@ -101,7 +101,7 @@ Within the control loop, you need to update the *current state* of the input par
 
 ### Intermediate Waypoints
 
-The Ruckig Community Version includes built-in support for intermediate waypoints, using our cloud API for remote calculation. Of course, the Ruckig Pro version is fully local. To allocate the necessary memory for a variable number of waypoints beforehand, we need to pass the maximum number of waypoints to Ruckig via
+Ruckig includes built-in support for intermediate waypoints. This fork calculates such trajectories *locally* with the `LocalWaypointsCalculator` (enabled by the `BUILD_LOCAL_WAYPOINTS` CMake option, on by default); the cloud API of the upstream Community Version is still available as an alternative backend (`BUILD_CLOUD_CLIENT`). To allocate the necessary memory for a variable number of waypoints beforehand, we need to pass the maximum number of waypoints to Ruckig via
 ```.cpp
 Ruckig ruckig {6, 0.001, 8};
 InputParameter input {6, 8};
@@ -114,13 +114,26 @@ input.intermediate_positions = {
   {0.8, ...},
 };
 ```
-As soon as intermediate positions are given, the Ruckig Community Version switches to the mentioned (of course, non real-time capable) cloud API. If you require real-time calculation on your own hardware, please contact us for the *Ruckig Pro Version*.
+As soon as intermediate positions are given, Ruckig switches to the waypoints calculator. The resulting trajectory passes exactly through every waypoint and consists of one time-synchronized section per pair of consecutive waypoints; the velocity and acceleration at each waypoint are chosen by an iterative optimization of the total trajectory duration (see below). The backend can be selected at runtime via
+```.cpp
+ruckig.set_waypoints_backend(WaypointsBackend::Local); // Default if built with BUILD_LOCAL_WAYPOINTS
+ruckig.set_waypoints_backend(WaypointsBackend::Cloud); // Requires BUILD_CLOUD_CLIENT and network access
+```
 
 When using *intermediate positions*, both the underlying motion planning problem as well as its calculation changes significantly. In particular, there are some fundamental limitations for jerk-limited online trajectory generation regarding the usage of waypoints. Please find more information about these limitations [here](https://docs.ruckig.com/md_pages_2__intermediate__waypoints.html), and in general we recommend to use
 ```.cpp
 input.intermediate_positions = ruckig.filter_intermediate_positions(input.intermediate_positions, {0.1, ...});
 ```
-to filter waypoints according to a (high) threshold distance. Setting *interrupt_calculation_duration* makes sure to be real-time capable by refining the solution in the next control invocation. Note that this is a soft interruption of the calculation. Currently, no minimum or discrete durations are supported when using intermediate positions.
+to filter waypoints according to a (high) threshold distance. Setting *interrupt_calculation_duration* softly interrupts the optimization and returns the best trajectory found so far. Currently, no global minimum or discrete durations are supported when using intermediate positions, but a *per_section_minimum_duration* is.
+
+The local waypoints calculator optimizes the kinematic state of every DoF at every waypoint for a minimal total duration: after structured initializations (stopping at every waypoint, following the path tangent, letting the slowest DoF lead), a coordinate-wise pattern search evaluates the exact synchronized section durations via Ruckig's own extremal profiles (*local steps*), re-initializes single waypoints to escape local minima (*global steps*), and finally reduces the deviation from the piecewise-linear path through the waypoints without increasing the duration (*smoothing steps*). Its hyperparameters trade calculation time for trajectory quality:
+```.cpp
+ruckig.calculator.local_waypoints_calculator.number_global_steps = 32; // Re-initializations of single waypoints
+ruckig.calculator.local_waypoints_calculator.number_local_steps = 32; // Sweeps of the pattern search
+ruckig.calculator.local_waypoints_calculator.number_smoothing_steps = 8; // Sweeps for reducing the path deviation
+ruckig.calculator.local_waypoints_calculator.smoothing_duration_tolerance = 0.0; // Allowed relative duration increase for a lower path deviation, e.g. 0.0025
+```
+With the default settings, a trajectory with 3 DoFs and 4 to 6 waypoints is calculated in around 200 to 400 ms; the trajectory is guaranteed to be faster than stopping at every waypoint. For replanning with unchanged waypoints, the velocities and accelerations at the waypoints of a previous solution can be passed as a warm start via `initial_velocities` and `initial_accelerations` (indexed by waypoint and DoF), and `calculate_from_states` calculates the trajectory for given waypoint states without any optimization.
 
 
 ### Input Parameter
@@ -166,6 +179,7 @@ On top of the current state, target state, and constraints, Ruckig allows for a 
 - A *minimum* velocity and acceleration can be specified - these should be a negative number. If they are not given, the negative maximum velocity or acceleration will be used (similar to the jerk limit). For example, this might be useful in human robot collaboration settings with a different velocity limit towards a human. Or, when switching between different moving coordinate frames like picking from a conveyer belt.
 - You can overwrite the global kinematic limits to specify limits for each section between two waypoints separately by using e.g. `per_section_max_velocity`.
 - If a DoF is not *enabled*, it will be ignored in the calculation. Ruckig will output a trajectory with constant acceleration for those DoFs.
+- The *positional limits* `max_position` and `min_position` (and their per-section variants) are checked for trajectories with intermediate waypoints; a violation is reported by `Result::ErrorPositionalLimits` while the trajectory is still calculated.
 - A *minimum duration* can be optionally given. Note that Ruckig can not guarantee an exact, but only a minimum duration of the trajectory.
 - The control interface (position or velocity control) can be switched easily. For example, a stop trajectory or visual servoing can be easily implemented with the velocity interface.
 - Different synchronization behaviors (i.a. phase, time, or no synchronization) are implemented. Phase synchronization results in straight-line motions.
@@ -220,7 +234,7 @@ size_t new_section; // Index of the section between two (possibly filtered) inte
 bool did_section_change; // Was a new section reached in the last cycle?
 
 bool new_calculation; // Whether a new calculation was performed in the last cycle
-bool was_calculation_interrupted; // Was the trajectory calculation interrupted? (only in Pro Version)
+bool was_calculation_interrupted; // Was the trajectory calculation interrupted? (with intermediate waypoints)
 double calculation_duration; // Duration of the calculation in the last cycle [µs]
 ```
 Moreover, the **trajectory** class has a range of useful parameters and methods.

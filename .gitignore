@@ -10,6 +10,7 @@ node_modules
 *.egg-info
 
 .env
+.venv
 build
 dist
 doc/html

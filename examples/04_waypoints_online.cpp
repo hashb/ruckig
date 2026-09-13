@@ -1,4 +1,4 @@
-// This example shows the usage of intermediate waypoints. It will only work with Ruckig Pro or enabled cloud API.
+// This example shows the usage of intermediate waypoints. It requires the local waypoints calculator (BUILD_LOCAL_WAYPOINTS) or the cloud API.
 
 #include <ruckig/ruckig.hpp>
 

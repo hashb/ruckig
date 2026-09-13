@@ -1,5 +1,5 @@
 # This example shows the usage of intermediate waypoints.
-# It will only work with Ruckig Pro or enabled cloud API (e.g. default when installed by pip / PyPI).
+# It requires the local waypoints calculator (BUILD_LOCAL_WAYPOINTS, default) or the cloud API.
 
 from copy import copy
 

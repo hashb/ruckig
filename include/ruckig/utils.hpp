@@ -9,6 +9,12 @@
 #include <vector>
 
 
+//! Trajectories with intermediate waypoints are available with the local waypoints calculator or the cloud client
+#if defined(WITH_CLOUD_CLIENT) || defined(WITH_LOCAL_WAYPOINTS)
+#define RUCKIG_WITH_WAYPOINTS
+#endif
+
+
 namespace ruckig {
 
 //! Constant for indicating a dynamic (run-time settable) number of DoFs

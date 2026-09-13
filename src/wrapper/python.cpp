@@ -49,6 +49,13 @@ limited by velocity, acceleration, and jerk constraints.";
         .value("ErrorSynchronizationCalculation", Result::ErrorSynchronizationCalculation)
         .export_values();
 
+#if defined RUCKIG_WITH_WAYPOINTS
+    nb::enum_<WaypointsBackend>(m, "WaypointsBackend")
+        .value("Local", WaypointsBackend::Local)
+        .value("Cloud", WaypointsBackend::Cloud)
+        .export_values();
+#endif
+
     nb::exception<RuckigError>(m, "RuckigError");
 
     nb::class_<Bound>(m, "Bound")
@@ -60,7 +67,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<Trajectory<>>(m, "Trajectory")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined RUCKIG_WITH_WAYPOINTS
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &Trajectory<>::degrees_of_freedom)
@@ -86,7 +93,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<InputParameter<>>(m, "InputParameter")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined RUCKIG_WITH_WAYPOINTS
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &InputParameter<>::degrees_of_freedom)
@@ -126,7 +133,7 @@ limited by velocity, acceleration, and jerk constraints.";
 
     nb::class_<OutputParameter<>>(m, "OutputParameter")
         .def(nb::init<size_t>(), "dofs"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined RUCKIG_WITH_WAYPOINTS
         .def(nb::init<size_t, size_t>(), "dofs"_a, "max_number_of_waypoints"_a)
 #endif
         .def_ro("degrees_of_freedom", &OutputParameter<>::degrees_of_freedom)
@@ -147,12 +154,37 @@ limited by velocity, acceleration, and jerk constraints.";
             return OutputParameter<>(self);
         });
 
+#if defined WITH_LOCAL_WAYPOINTS
+    nb::class_<LocalWaypointsCalculator<DynamicDOFs>>(m, "LocalWaypointsCalculator")
+        .def_ro("degrees_of_freedom", &LocalWaypointsCalculator<DynamicDOFs>::degrees_of_freedom)
+        .def_rw("number_global_steps", &LocalWaypointsCalculator<DynamicDOFs>::number_global_steps)
+        .def_rw("number_local_steps", &LocalWaypointsCalculator<DynamicDOFs>::number_local_steps)
+        .def_rw("number_smoothing_steps", &LocalWaypointsCalculator<DynamicDOFs>::number_smoothing_steps)
+        .def_rw("smoothing_duration_tolerance", &LocalWaypointsCalculator<DynamicDOFs>::smoothing_duration_tolerance)
+        .def_rw("initial_velocities", &LocalWaypointsCalculator<DynamicDOFs>::initial_velocities)
+        .def_rw("initial_accelerations", &LocalWaypointsCalculator<DynamicDOFs>::initial_accelerations)
+        .def_rw("debug", &LocalWaypointsCalculator<DynamicDOFs>::debug)
+        .def("calculate_from_states", &LocalWaypointsCalculator<DynamicDOFs>::calculate_from_states<true>, "input"_a, "trajectory"_a, "delta_time"_a, "velocities"_a, "accelerations"_a);
+#endif
+
+#if defined RUCKIG_WITH_WAYPOINTS
+    nb::class_<Calculator<DynamicDOFs>>(m, "Calculator")
+        .def_rw("waypoints_backend", &Calculator<DynamicDOFs>::waypoints_backend)
+#if defined WITH_LOCAL_WAYPOINTS
+        .def_prop_ro("local_waypoints_calculator", [](Calculator<DynamicDOFs>& calculator) -> LocalWaypointsCalculator<DynamicDOFs>& { return calculator.local_waypoints_calculator; }, nb::rv_policy::reference_internal)
+#endif
+        ;
+#endif
+
     nb::class_<RuckigThrow<DynamicDOFs>>(m, "Ruckig")
         .def(nb::init<size_t>(), "dofs"_a)
         .def(nb::init<size_t, double>(), "dofs"_a, "delta_time"_a)
-#if defined WITH_CLOUD_CLIENT
+#if defined RUCKIG_WITH_WAYPOINTS
         .def(nb::init<size_t, double, size_t>(), "dofs"_a, "delta_time"_a, "max_number_of_waypoints"_a=0)
         .def("filter_intermediate_positions", &RuckigThrow<DynamicDOFs>::filter_intermediate_positions, "input"_a, "threshold_distance"_a)
+        .def("set_waypoints_backend", &RuckigThrow<DynamicDOFs>::set_waypoints_backend, "backend"_a)
+        .def("get_waypoints_backend", &RuckigThrow<DynamicDOFs>::get_waypoints_backend)
+        .def_prop_ro("calculator", [](RuckigThrow<DynamicDOFs>& ruckig) -> Calculator<DynamicDOFs>& { return ruckig.calculator; }, nb::rv_policy::reference_internal)
 #endif
         .def_ro("max_number_of_waypoints", &RuckigThrow<DynamicDOFs>::max_number_of_waypoints)
         .def_ro("degrees_of_freedom", &RuckigThrow<DynamicDOFs>::degrees_of_freedom)

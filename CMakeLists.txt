@@ -10,6 +10,7 @@ include(GNUInstallDirs)
 option(BUILD_EXAMPLES "Build example programs" ON)
 option(BUILD_PYTHON_MODULE "Build Python wrapper with nanobind" OFF)
 option(BUILD_CLOUD_CLIENT "Build cloud client to calculate Ruckig Pro trajectories remotely" ON)
+option(BUILD_LOCAL_WAYPOINTS "Build local calculator for trajectories with intermediate waypoints" ON)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmark" OFF)
 option(BUILD_SHARED_LIBS "Build as shared library" ON)
@@ -53,6 +54,10 @@ if(BUILD_CLOUD_CLIENT)
   target_compile_definitions(ruckig PUBLIC WITH_CLOUD_CLIENT)
 endif()
 
+if(BUILD_LOCAL_WAYPOINTS)
+  target_compile_definitions(ruckig PUBLIC WITH_LOCAL_WAYPOINTS)
+endif()
+
 add_library(ruckig::ruckig ALIAS ruckig)
 
 
@@ -71,6 +76,12 @@ if(BUILD_TESTS)
   add_executable(test-target test/test_target.cpp)
   target_link_libraries(test-target PRIVATE test-dependencies)
   add_test(NAME test-target COMMAND test-target)
+
+  if(BUILD_LOCAL_WAYPOINTS)
+    add_executable(test-waypoints test/test_waypoints.cpp)
+    target_link_libraries(test-waypoints PRIVATE test-dependencies)
+    add_test(NAME test-waypoints COMMAND test-waypoints)
+  endif()
   if(NOT MSVC)
     include(CTest)
     find_program(MEMORYCHECK_COMMAND valgrind)
@@ -82,8 +93,12 @@ endif()
 
 if(BUILD_BENCHMARK)
   add_executable(benchmark-target test/benchmark_target.cpp)
-
   target_link_libraries(benchmark-target PRIVATE ruckig)
+
+  if(BUILD_LOCAL_WAYPOINTS)
+    add_executable(benchmark-waypoints test/benchmark_waypoints.cpp)
+    target_link_libraries(benchmark-waypoints PRIVATE ruckig)
+  endif()
 endif()
 
 
@@ -93,8 +108,8 @@ if(BUILD_EXAMPLES)
     list(APPEND EXAMPLES_LIST 11_eigen_vector_type)
   endif()
 
-  if(BUILD_CLOUD_CLIENT)
-    list(APPEND EXAMPLES_LIST 03_waypoints 04_waypoints_online 08_per_section_minimum_duration)
+  if(BUILD_CLOUD_CLIENT OR BUILD_LOCAL_WAYPOINTS)
+    list(APPEND EXAMPLES_LIST 03_waypoints 04_waypoints_online 08_per_section_minimum_duration 17_waypoints_backend)
   endif()
 
   foreach(example IN LISTS EXAMPLES_LIST)
@@ -116,6 +131,9 @@ if(BUILD_PYTHON_MODULE)
   target_link_libraries(python_ruckig PUBLIC ruckig)
   if(BUILD_CLOUD_CLIENT)
     target_compile_definitions(python_ruckig PUBLIC WITH_CLOUD_CLIENT)
+  endif()
+  if(BUILD_LOCAL_WAYPOINTS)
+    target_compile_definitions(python_ruckig PUBLIC WITH_LOCAL_WAYPOINTS)
   endif()
 
   set_target_properties(python_ruckig PROPERTIES OUTPUT_NAME ruckig)
